@@ -2,7 +2,9 @@
 name = "semtriage"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14.4",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -24,4 +26,4 @@ addopts = "-x -q"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-lint = { select = ["E", "F", "I", "UP", "B"] }
+lint = { select = ["E", "F", "I", "UP", "B"], isort = { known-first-party = ["semtriage"] } }
