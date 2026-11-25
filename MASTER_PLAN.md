@@ -37,7 +37,8 @@ bge-m3 (dense and sparse) through FlagEmbedding, bge-reranker-v2-m3, an 8B instr
 - Python 3.12 or newer, `uv`, src layout, package `semtriage`, `pytest`, `ruff`.
 - Raw and derived data live under `data/` (git-ignored).
 - Work happens on branches, never directly on `main`.
-- Implementation tasks are delegated to Copilot CLI through brief files in `docs/briefs/`. Tests are written first.
+- Tests are written first. Implementation tasks are delegated to DeepSeek v4.1 (variant max) through `opencode run`, one fresh run per task, with a brief file in `.briefs/` (kept local, not committed). Claude reviews the diff, runs tests and lint, and commits. P1-T1 and P1-T2 were done with Copilot CLI; their briefs remain in `docs/briefs/`.
+- Briefs and every file the implementer can read must hold no private data or credentials.
 
 ## Phase 1: recording, labeled dataset, offline dedup
 
@@ -45,7 +46,7 @@ bge-m3 (dense and sparse) through FlagEmbedding, bge-reranker-v2-m3, an 8B instr
 |---|---|---|---|
 | P1-T1 | Project scaffold and text sanitizer that strips CVE and GHSA identifiers and advisory URLs | done | [brief](docs/briefs/P1-T1-sanitize.md) |
 | P1-T2 | Clustering metrics: pairwise P/R/F1 and B-cubed | done | [brief](docs/briefs/P1-T2-metrics.md) |
-| P1-T3 | `Event` model and normalizers from NVD and GHSA raw JSON (fixtures from real responses) | todo | |
+| P1-T3 | `Event` model and normalizers from NVD and GHSA raw JSON (fixtures from real responses) | done | local `.briefs/P1-T3-events.md` |
 | P1-T4 | HTTP clients for NVD and GHSA with pagination and rate limiting (mocked transport in tests) | todo | |
 | P1-T5 | Bronze writer (raw JSONL per source and day, content hash dedup) and backfill CLI by date range | todo | |
 | P1-T6 | Dataset builder: bronze to sanitized events ordered by `published`, with dataset statistics and GHSA vs NVD lag | todo | |
@@ -66,7 +67,8 @@ Not started.
 ## Open items
 
 - Request a free NVD API key (Diego).
-- Copilot credit usage per task is logged in `docs/briefs/USAGE.md`. P1-T1 cost 1.03 AI credits, P1-T2 cost 0.89.
+- Copilot credit usage for P1-T1 and P1-T2 is logged in `docs/briefs/USAGE.md`.
+- DeepSeek runs: P1-T3 right first time, 1 run, 61 s wall time, no fixes needed.
 - Briefs must say that `uv.lock` is kept and that tool configuration in `pyproject.toml` must not be loosened to pass checks.
 
 ## Session log
@@ -74,3 +76,4 @@ Not started.
 - 2026-11-25: validated data sources (ADR 0001), created this plan, split phase 1 into tasks, completed P1-T1 with Copilot (branch `p1-t1-sanitize`).
 - 2026-11-25: completed P1-T2 with Copilot (branch `p1-t2-metrics`).
 - 2026-11-25: published the repository on GitHub and merged P1-T1 (PR 1) and P1-T2 (PR 2) into `main`. Next task: P1-T3.
+- 2026-11-25: switched the implementer to DeepSeek v4.1 through opencode. Completed P1-T3 (branch `p1-t3-events`, not pushed). Next task: P1-T4.
