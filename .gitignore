@@ -1,0 +1,17 @@
+# Raw and derived data never get committed
+data/
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# Local
+.env
+.DS_Store
+.copilot-runs/
