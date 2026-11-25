@@ -47,7 +47,7 @@ bge-m3 (dense and sparse) through FlagEmbedding, bge-reranker-v2-m3, an 8B instr
 | P1-T1 | Project scaffold and text sanitizer that strips CVE and GHSA identifiers and advisory URLs | done | [brief](docs/briefs/P1-T1-sanitize.md) |
 | P1-T2 | Clustering metrics: pairwise P/R/F1 and B-cubed | done | [brief](docs/briefs/P1-T2-metrics.md) |
 | P1-T3 | `Event` model and normalizers from NVD and GHSA raw JSON (fixtures from real responses) | done | local `.briefs/P1-T3-events.md` |
-| P1-T4 | HTTP clients for NVD and GHSA with pagination and rate limiting (mocked transport in tests) | todo | |
+| P1-T4 | HTTP clients for NVD and GHSA with pagination and rate limiting (mocked transport in tests) | done | local `.briefs/P1-T4-clients.md` |
 | P1-T5 | Bronze writer (raw JSONL per source and day, content hash dedup) and backfill CLI by date range | todo | |
 | P1-T6 | Dataset builder: bronze to sanitized events ordered by `published`, with dataset statistics and GHSA vs NVD lag | todo | |
 | P1-T7 | Offline dedup baseline: `Embedder` protocol, dense embedding plus threshold clustering, threshold sweep reported with P1-T2 metrics | todo | |
@@ -68,7 +68,8 @@ Not started.
 
 - Request a free NVD API key (Diego).
 - Copilot credit usage for P1-T1 and P1-T2 is logged in `docs/briefs/USAGE.md`.
-- DeepSeek runs: P1-T3 right first time, 1 run, 61 s wall time, no fixes needed.
+- DeepSeek runs: P1-T3 right first time, 1 run, 61 s wall time, no fixes needed. P1-T4 right first time, 1 run, 26 s, no fixes needed.
+- Coordinator mode: opencode output always goes to a log file; independent tasks get their own session and worktree, in parallel only when files are disjoint. After P1-T4, P1-T5 and P1-T7 can run in parallel; P1-T6 needs the P1-T5 bronze format.
 - Briefs must say that `uv.lock` is kept and that tool configuration in `pyproject.toml` must not be loosened to pass checks.
 
 ## Session log
@@ -77,3 +78,4 @@ Not started.
 - 2026-11-25: completed P1-T2 with Copilot (branch `p1-t2-metrics`).
 - 2026-11-25: published the repository on GitHub and merged P1-T1 (PR 1) and P1-T2 (PR 2) into `main`. Next task: P1-T3.
 - 2026-11-25: switched the implementer to DeepSeek v4.1 through opencode. Completed P1-T3 (branch `p1-t3-events`, not pushed). Next task: P1-T4.
+- 2026-11-25: completed P1-T4 with DeepSeek (branch `p1-t4-clients`, stacked on `p1-t3-events`, not pushed). Next: P1-T5 and P1-T7 in parallel sessions.
