@@ -72,4 +72,5 @@ Not started.
 ## Session log
 
 - 2026-11-25: validated data sources (ADR 0001), created this plan, split phase 1 into tasks, completed P1-T1 with Copilot (branch `p1-t1-sanitize`).
-- 2026-11-25: completed P1-T2 with Copilot (branch `p1-t2-metrics`, stacked on `p1-t1-sanitize`, neither merged yet).
+- 2026-11-25: completed P1-T2 with Copilot (branch `p1-t2-metrics`).
+- 2026-11-25: published the repository on GitHub and merged P1-T1 (PR 1) and P1-T2 (PR 2) into `main`. Next task: P1-T3.
