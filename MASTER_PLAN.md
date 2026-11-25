@@ -44,7 +44,7 @@ bge-m3 (dense and sparse) through FlagEmbedding, bge-reranker-v2-m3, an 8B instr
 | ID | Task | Status | Brief |
 |---|---|---|---|
 | P1-T1 | Project scaffold and text sanitizer that strips CVE and GHSA identifiers and advisory URLs | done | [brief](docs/briefs/P1-T1-sanitize.md) |
-| P1-T2 | Clustering metrics: pairwise P/R/F1 and B-cubed | todo | |
+| P1-T2 | Clustering metrics: pairwise P/R/F1 and B-cubed | done | [brief](docs/briefs/P1-T2-metrics.md) |
 | P1-T3 | `Event` model and normalizers from NVD and GHSA raw JSON (fixtures from real responses) | todo | |
 | P1-T4 | HTTP clients for NVD and GHSA with pagination and rate limiting (mocked transport in tests) | todo | |
 | P1-T5 | Bronze writer (raw JSONL per source and day, content hash dedup) and backfill CLI by date range | todo | |
@@ -66,9 +66,10 @@ Not started.
 ## Open items
 
 - Request a free NVD API key (Diego).
-- Copilot credit usage per task is logged in `docs/briefs/USAGE.md`. P1-T1 cost 1.03 AI credits.
+- Copilot credit usage per task is logged in `docs/briefs/USAGE.md`. P1-T1 cost 1.03 AI credits, P1-T2 cost 0.89.
 - Briefs must say that `uv.lock` is kept and that tool configuration in `pyproject.toml` must not be loosened to pass checks.
 
 ## Session log
 
 - 2026-11-25: validated data sources (ADR 0001), created this plan, split phase 1 into tasks, completed P1-T1 with Copilot (branch `p1-t1-sanitize`).
+- 2026-11-25: completed P1-T2 with Copilot (branch `p1-t2-metrics`, stacked on `p1-t1-sanitize`, neither merged yet).
