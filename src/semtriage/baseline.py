@@ -99,14 +99,15 @@ def _collect_edges(
     right_parts: list[np.ndarray] = []
     for start in range(0, row_count, 1024):
         stop = min(start + 1024, row_count)
-        block = matrix[start:stop] @ matrix.T
-        local_rows, cols = np.nonzero(block >= minimum_threshold)
+        block = matrix[start:stop] @ matrix[start:].T
+        local_rows, local_cols = np.nonzero(block >= minimum_threshold)
         rows = local_rows + start
+        cols = local_cols + start
         keep = rows < cols
         if np.any(keep):
             rows = rows[keep]
             cols = cols[keep]
-            similarity_parts.append(block[local_rows[keep], cols])
+            similarity_parts.append(block[local_rows[keep], local_cols[keep]])
             left_parts.append(rows)
             right_parts.append(cols)
 
@@ -264,13 +265,16 @@ def format_report(report: BaselineReport) -> str:
 def load_events(path: str | Path) -> list[Event]:
     """Load non-blank JSONL lines as advisory events."""
     events: list[Event] = []
-    with Path(path).open("r", encoding="utf-8") as source:
-        for lineno, line in enumerate(source, start=1):
-            if line.strip():
-                try:
-                    events.append(Event.model_validate_json(line))
-                except ValidationError as exc:
-                    raise ValueError(f"{path}:{lineno}: invalid event") from exc
+    try:
+        with Path(path).open("r", encoding="utf-8") as source:
+            for lineno, line in enumerate(source, start=1):
+                if line.strip():
+                    try:
+                        events.append(Event.model_validate_json(line))
+                    except ValidationError as exc:
+                        raise ValueError(f"{path}:{lineno}: invalid event") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path}: not valid UTF-8") from exc
     return events
 
 

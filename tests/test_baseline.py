@@ -391,3 +391,47 @@ def test_main_malformed_events_is_a_usage_error(tmp_path, capsys):
         main(["--events", str(path)])
     assert excinfo.value.code == 2
     assert "events.jsonl:1" in capsys.readouterr().err
+
+
+# Review minors (P1-T7e)
+
+
+def _brute_force_labels(vectors, threshold):
+    sims = vectors.astype(np.float64) @ vectors.astype(np.float64).T
+    n = len(vectors)
+    labels = list(range(n))
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            for j in np.nonzero(sims[i] >= threshold)[0]:
+                low = min(labels[i], labels[j])
+                if labels[i] != low or labels[j] != low:
+                    labels[i] = labels[j] = low
+                    changed = True
+    return labels
+
+
+def test_threshold_clusters_across_row_blocks_matches_brute_force():
+    rng = np.random.default_rng(5)
+    base = rng.normal(size=(60, 6))
+    picks = rng.integers(0, 60, size=1100)
+    vectors = base[picks] + rng.normal(scale=0.05, size=(1100, 6))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    for threshold in (0.995, 0.97):
+        assert threshold_clusters(vectors, threshold) == _brute_force_labels(vectors, threshold)
+
+
+def test_load_events_non_utf8_reports_path(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b"\xff\xfe not utf-8\n")
+    with pytest.raises(ValueError, match=r"events\.jsonl"):
+        load_events(path)
+
+
+def test_main_non_utf8_events_is_a_usage_error(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(b"\xff\xfe not utf-8\n")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--events", str(path)])
+    assert excinfo.value.code == 2
