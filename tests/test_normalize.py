@@ -152,12 +152,25 @@ def test_ghsa_multiple_packages_sorted_unique(ghsa_item):
         ("medium", "MEDIUM"),
         ("moderate", "MEDIUM"),
         ("HIGH", "HIGH"),
+        ("critical", "CRITICAL"),
         ("unknown", None),
+        (None, None),
     ],
 )
 def test_ghsa_severity_mapping(ghsa_item, raw, expected):
     ghsa_item["severity"] = raw
     assert normalize_ghsa(ghsa_item).severity == expected
+
+
+def test_ghsa_missing_optional_keys(ghsa_item):
+    for key in ("identifiers", "cwes", "vulnerabilities", "summary"):
+        del ghsa_item[key]
+    event = normalize_ghsa(ghsa_item)
+    assert event.cve_ids == ("CVE-2026-64670",)
+    assert event.cwe_ids == ()
+    assert event.ecosystems == ()
+    assert event.packages == ()
+    assert event.text.startswith("### Summary")
 
 
 def test_ghsa_withdrawn_is_skipped(ghsa_item):
