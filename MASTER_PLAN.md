@@ -16,6 +16,7 @@ A local LLM combines the live event with the retrieved context and writes a diag
 - Windows tower, RTX 5070 12 GB (Blackwell sm_120, CUDA 12.8 or newer, PyTorch cu128, Python in WSL2): Ollama, Qdrant in Docker (named volume), FastAPI backend.
 - MacBook Air M4 over LAN: Streamlit frontend, evaluation, development.
 - Ollama and Qdrant bind to 127.0.0.1. Only FastAPI, behind an API key, is exposed to the LAN. Image versions are pinned.
+- Tower setup steps and checks for the tower session: [docs/tower-setup.md](docs/tower-setup.md).
 
 ## Stack
 
