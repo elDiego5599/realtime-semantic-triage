@@ -1,5 +1,6 @@
 """HTTP clients for the NVD CVE API and GitHub global advisories."""
 
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -48,7 +49,7 @@ class RateLimiter:
         """Block until a call is allowed, then record it."""
         now = self._clock()
         self._drop_expired(now)
-        if len(self._calls) >= self.max_calls:
+        while len(self._calls) >= self.max_calls:
             self._sleep(self._calls[0] + self.window - now)
             now = self._clock()
             self._drop_expired(now)
@@ -71,6 +72,40 @@ def _validate_range(start: datetime, end: datetime) -> None:
         raise ValueError("start must be before end")
 
 
+def _header_wait(response: httpx.Response, wall_clock: Callable[[], float]) -> float:
+    wait = 0.0
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        value = retry_after.strip()
+        if value.isascii() and value.isdigit():
+            wait = max(wait, float(value))
+    remaining = response.headers.get("x-ratelimit-remaining")
+    reset = response.headers.get("x-ratelimit-reset")
+    if remaining == "0" and reset is not None:
+        try:
+            seconds = float(reset)
+        except ValueError:
+            pass
+        else:
+            if math.isfinite(seconds):
+                wait = max(wait, seconds - wall_clock())
+    return max(wait, 0.0)
+
+
+def _validate_max_wait(max_wait: float) -> None:
+    if not (math.isfinite(max_wait) and max_wait >= 0):
+        raise ValueError("max_wait must be finite and non-negative")
+
+
+def _ghsa_rate_limited(response: httpx.Response) -> bool:
+    return response.headers.get("x-ratelimit-remaining") == "0" or "Retry-After" in response.headers
+
+
+# NVD answers 403 when throttled, so every 403 is retried.
+def _nvd_rate_limited(response: httpx.Response) -> bool:
+    return True
+
+
 def _request(
     http: httpx.Client,
     limiter: Limiter,
@@ -80,14 +115,28 @@ def _request(
     headers: dict[str, str],
     max_retries: int,
     backoff: float,
+    max_wait: float,
     sleep: Callable[[float], None],
+    retry_forbidden: Callable[[httpx.Response], bool],
+    wall_clock: Callable[[], float],
 ) -> httpx.Response:
     retries = 0
     while True:
         limiter.acquire()
-        response = http.get(url, params=params, headers=headers)
-        if response.status_code in RETRY_STATUSES and retries < max_retries:
-            sleep(backoff * 2**retries)
+        try:
+            response = http.get(url, params=params, headers=headers)
+        except httpx.TransportError:
+            if retries >= max_retries:
+                raise
+            sleep(min(backoff * 2**retries, max_wait))
+            retries += 1
+            continue
+        retryable = response.status_code in RETRY_STATUSES or (
+            response.status_code == 403 and retry_forbidden(response)
+        )
+        if retryable and retries < max_retries:
+            wait = max(backoff * 2**retries, _header_wait(response, wall_clock))
+            sleep(min(wait, max_wait))
             retries += 1
             continue
         response.raise_for_status()
@@ -106,15 +155,22 @@ class NvdClient:
         page_size: int = 2000,
         max_retries: int = 3,
         backoff: float = 1.0,
+        max_wait: float = 3600.0,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
     ) -> None:
+        if not 1 <= page_size <= 2000:
+            raise ValueError("page_size must be between 1 and 2000")
+        _validate_max_wait(max_wait)
         self._http = http
         self._headers = {"apiKey": api_key} if api_key else {}
         self.limiter = limiter or RateLimiter(50 if api_key else 5, 30.0)
         self._page_size = page_size
         self._max_retries = max_retries
         self._backoff = backoff
+        self._max_wait = max_wait
         self._sleep = sleep
+        self._clock = clock
 
     def iter_cves(
         self,
@@ -130,7 +186,8 @@ class NvdClient:
         else:
             start_key, end_key = "pubStartDate", "pubEndDate"
 
-        window_start = start
+        window_start = start.astimezone(UTC)
+        end = end.astimezone(UTC)
         while window_start < end:
             window_end = min(window_start + _NVD_MAX_WINDOW, end)
             yield from self._iter_window(start_key, end_key, window_start, window_end)
@@ -159,11 +216,17 @@ class NvdClient:
                 headers=self._headers,
                 max_retries=self._max_retries,
                 backoff=self._backoff,
+                max_wait=self._max_wait,
                 sleep=self._sleep,
+                retry_forbidden=_nvd_rate_limited,
+                wall_clock=self._clock,
             )
             body = response.json()
-            yield from body["vulnerabilities"]
-            start_index += self._page_size
+            vulnerabilities = body["vulnerabilities"]
+            yield from vulnerabilities
+            if not vulnerabilities:
+                return
+            start_index += len(vulnerabilities)
             if start_index >= body["totalResults"]:
                 return
 
@@ -180,20 +243,36 @@ class GhsaClient:
         per_page: int = 100,
         max_retries: int = 3,
         backoff: float = 1.0,
+        max_wait: float = 3600.0,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
     ) -> None:
+        _validate_max_wait(max_wait)
         self._http = http
+        self._token = token
         self._headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if token:
-            self._headers["Authorization"] = f"Bearer {token}"
         self.limiter = limiter or RateLimiter(5000 if token else 60, 3600.0)
         self._per_page = per_page
         self._max_retries = max_retries
         self._backoff = backoff
+        self._max_wait = max_wait
         self._sleep = sleep
+        self._clock = clock
+
+    def _headers_for(self, url: str) -> dict[str, str]:
+        headers = dict(self._headers)
+        target = httpx.URL(url)
+        if (
+            self._token
+            and target.scheme == "https"
+            and target.host == "api.github.com"
+            and target.port in (None, 443)
+        ):
+            headers["Authorization"] = f"Bearer {self._token}"
+        return headers
 
     def iter_advisories(
         self,
@@ -218,10 +297,13 @@ class GhsaClient:
                 self.limiter,
                 url,
                 params=params,
-                headers=self._headers,
+                headers=self._headers_for(url),
                 max_retries=self._max_retries,
                 backoff=self._backoff,
+                max_wait=self._max_wait,
                 sleep=self._sleep,
+                retry_forbidden=_ghsa_rate_limited,
+                wall_clock=self._clock,
             )
             yield from response.json()
             next_link = response.links.get("next")
