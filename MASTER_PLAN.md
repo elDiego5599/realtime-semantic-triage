@@ -74,3 +74,4 @@ Not started.
 - 2026-11-25: validated data sources (ADR 0001), created this plan, split phase 1 into tasks, completed P1-T1 with Copilot (branch `p1-t1-sanitize`).
 - 2026-11-25: completed P1-T2 with Copilot (branch `p1-t2-metrics`).
 - 2026-11-25: published the repository on GitHub and merged P1-T1 (PR 1) and P1-T2 (PR 2) into `main`. Next task: P1-T3.
+- 2026-11-25: fixed label-leak gaps in `sanitize.py` found by the post-merge review (ID boundaries next to `_` and letters, Unicode dashes, URL boundaries, repeated empty-markup cleanup, rescan until stable). Implemented by DeepSeek through opencode in two runs (103 s and 86 s), reviewed by a fresh reviewer. Branch `claude/brave-wilson-05b039`, uncommitted. Open: decide whether U+2212, U+FF0D, zero-width spaces or plain spaces as ID separators need handling.

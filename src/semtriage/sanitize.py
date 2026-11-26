@@ -2,23 +2,84 @@
 
 import re
 
-_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
-_GHSA_RE = re.compile(
-    r"\bGHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}\b",
+_SENTINEL = "\x00"
+_DASH = "-\u2010\u2011\u2012\u2013\u2014\u2015"
+
+_CVE_RE = re.compile(
+    rf"(?<![A-Za-z0-9])CVE[{_DASH}][0-9]{{4}}[{_DASH}][0-9]{{4,}}(?![0-9])",
     re.IGNORECASE,
 )
-_URL_RE = re.compile(r"https?://[^\s]*[^\s.,;:!?)\]}'\"]", re.IGNORECASE)
-_EMPTY_BRACKETS_RE = re.compile(r"\(\s*\)|\[\s*\]")
+_GHSA_RE = re.compile(
+    rf"(?<![A-Za-z0-9])GHSA(?:[{_DASH}][A-Za-z0-9]{{4}}){{3}}(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(
+    r"""https?://(?:[^\s<>"'()]|\([^\s<>"'()]*\))*""",
+    re.IGNORECASE,
+)
+_MARKDOWN_LINK_RE = re.compile(rf"\[([^\[\]]*)\]\({_SENTINEL}\)")
+_EMPTY_PAIR_RES = (
+    re.compile(rf"\([\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*\)"),
+    re.compile(rf"\[[\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*\]"),
+    re.compile(rf"<[\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*>"),
+    re.compile(
+        rf"(?<![^\s{_SENTINEL}(\[<])\*\*"
+        rf"[\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*"
+        rf"\*\*(?![^\s{_SENTINEL})\]>.,;:!?])"
+    ),
+)
+_UNICODE_DASH_RE = re.compile(r"[\u2010-\u2015]")
 _HORIZONTAL_WHITESPACE_RE = re.compile(r"[ \t]+")
 _EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
 
 
+def _trim_url(url: str) -> str:
+    """Drop trailing punctuation and unmatched closing brackets from a URL."""
+    while url:
+        last = url[-1]
+        if last in ".,;:!?*}":
+            url = url[:-1]
+        elif last == "]" and url.count("]") > url.count("["):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
+def _replace_url(match: re.Match[str]) -> str:
+    matched = match.group(0)
+    trimmed = _trim_url(matched)
+    return _SENTINEL + matched[len(trimmed) :]
+
+
+def _clean_empty_markup(text: str) -> str:
+    """Remove bracket pairs that a removal left empty, innermost first."""
+    while True:
+        updated = text
+        for pattern in _EMPTY_PAIR_RES:
+            updated = pattern.sub(_SENTINEL, updated)
+        if updated == text:
+            return text
+        text = updated
+
+
+def _canonical_identifier(identifier: str) -> str:
+    return _UNICODE_DASH_RE.sub("-", identifier).upper()
+
+
 def sanitize(text: str) -> str:
     """Remove identifiers and URLs, and normalize advisory text whitespace."""
-    result = _URL_RE.sub("", text)
-    result = _CVE_RE.sub("", result)
-    result = _GHSA_RE.sub("", result)
-    result = _EMPTY_BRACKETS_RE.sub("", result)
+    result = text
+    while True:
+        updated = _URL_RE.sub(_replace_url, result)
+        updated = _CVE_RE.sub(_SENTINEL, updated)
+        updated = _GHSA_RE.sub(_SENTINEL, updated)
+        updated = _MARKDOWN_LINK_RE.sub(r"\1", updated)
+        updated = _clean_empty_markup(updated)
+        updated = updated.replace(_SENTINEL, "")
+        if updated == result:
+            break
+        result = updated
 
     lines = []
     for line in result.split("\n"):
@@ -32,6 +93,8 @@ def sanitize(text: str) -> str:
 
 def find_identifiers(text: str) -> set[str]:
     """Return unique CVE and GHSA identifiers found in text, uppercased."""
-    identifiers = {match.group(0).upper() for match in _CVE_RE.finditer(text)}
-    identifiers.update(match.group(0).upper() for match in _GHSA_RE.finditer(text))
-    return identifiers
+    return {
+        _canonical_identifier(match.group(0))
+        for pattern in (_CVE_RE, _GHSA_RE)
+        for match in pattern.finditer(text)
+    }
