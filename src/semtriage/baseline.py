@@ -27,6 +27,8 @@ DEFAULT_THRESHOLDS: tuple[float, ...] = (
     0.95,
 )
 
+PAIR_MODES: tuple[str, ...] = ("cross-source", "all")
+
 
 def gold_label(event: Event) -> str | None:
     """Return the event's sole CVE label, if it has exactly one."""
@@ -81,47 +83,80 @@ def _finite_matrix(vectors: np.ndarray) -> np.ndarray:
     return matrix
 
 
-def _collect_edges(
-    matrix: np.ndarray,
-    minimum_threshold: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Collect upper-triangular candidate edges in NumPy row blocks."""
-    row_count = len(matrix)
-    if row_count < 2:
+_BLOCK_ROWS = 1024
+
+_Edges = tuple[np.ndarray, np.ndarray, np.ndarray]
+
+
+def _sorted_edges(
+    similarity_parts: list[np.ndarray],
+    left_parts: list[np.ndarray],
+    right_parts: list[np.ndarray],
+) -> _Edges:
+    """Join edge blocks and order them by descending similarity (stable)."""
+    if not similarity_parts:
         return (
             np.empty(0, dtype=np.float64),
             np.empty(0, dtype=np.int64),
             np.empty(0, dtype=np.int64),
         )
+    similarities = np.concatenate(similarity_parts)
+    lefts = np.concatenate(left_parts)
+    rights = np.concatenate(right_parts)
+    order = np.argsort(-similarities, kind="stable")
+    return similarities[order], lefts[order], rights[order]
+
+
+def _collect_edges(matrix: np.ndarray, minimum_threshold: float) -> _Edges:
+    """Collect upper-triangular candidate edges in NumPy row blocks."""
+    similarity_parts: list[np.ndarray] = []
+    left_parts: list[np.ndarray] = []
+    right_parts: list[np.ndarray] = []
+    for start in range(0, len(matrix), _BLOCK_ROWS):
+        block = matrix[start : start + _BLOCK_ROWS] @ matrix[start:].T
+        local_rows, local_cols = np.nonzero(block >= minimum_threshold)
+        keep = local_rows < local_cols
+        if np.any(keep):
+            similarity_parts.append(block[local_rows[keep], local_cols[keep]])
+            left_parts.append(local_rows[keep] + start)
+            right_parts.append(local_cols[keep] + start)
+    return _sorted_edges(similarity_parts, left_parts, right_parts)
+
+
+def _collect_cross_edges(
+    matrix: np.ndarray,
+    groups: Sequence[Hashable],
+    minimum_threshold: float,
+) -> _Edges:
+    """Collect edges only between rows of different groups, in NumPy row blocks.
+
+    Only cross-group dot products are computed. The larger group of each pair is
+    walked in row blocks against all rows of the smaller one, so a block holds at
+    most 1024 rows times the smaller group's size.
+    """
+    rows_by_group: dict[Hashable, list[int]] = {}
+    for row, group in enumerate(groups):
+        rows_by_group.setdefault(group, []).append(row)
+    group_rows = [np.asarray(rows, dtype=np.int64) for rows in rows_by_group.values()]
 
     similarity_parts: list[np.ndarray] = []
     left_parts: list[np.ndarray] = []
     right_parts: list[np.ndarray] = []
-    for start in range(0, row_count, 1024):
-        stop = min(start + 1024, row_count)
-        block = matrix[start:stop] @ matrix[start:].T
-        local_rows, local_cols = np.nonzero(block >= minimum_threshold)
-        rows = local_rows + start
-        cols = local_cols + start
-        keep = rows < cols
-        if np.any(keep):
-            rows = rows[keep]
-            cols = cols[keep]
-            similarity_parts.append(block[local_rows[keep], local_cols[keep]])
-            left_parts.append(rows)
-            right_parts.append(cols)
-
-    if not similarity_parts:
-        similarities = np.empty(0, dtype=np.float64)
-        lefts = np.empty(0, dtype=np.int64)
-        rights = np.empty(0, dtype=np.int64)
-    else:
-        similarities = np.concatenate(similarity_parts)
-        lefts = np.concatenate(left_parts)
-        rights = np.concatenate(right_parts)
-
-    order = np.argsort(-similarities, kind="stable")
-    return similarities[order], lefts[order], rights[order]
+    for index, first in enumerate(group_rows):
+        for second in group_rows[index + 1 :]:
+            outer, inner = (first, second) if len(first) >= len(second) else (second, first)
+            inner_matrix = matrix[inner]
+            for start in range(0, len(outer), _BLOCK_ROWS):
+                outer_rows = outer[start : start + _BLOCK_ROWS]
+                block = matrix[outer_rows] @ inner_matrix.T
+                local_rows, local_cols = np.nonzero(block >= minimum_threshold)
+                if len(local_rows):
+                    rows = outer_rows[local_rows]
+                    cols = inner[local_cols]
+                    similarity_parts.append(block[local_rows, local_cols])
+                    left_parts.append(np.minimum(rows, cols))
+                    right_parts.append(np.maximum(rows, cols))
+    return _sorted_edges(similarity_parts, left_parts, right_parts)
 
 
 def _check_thresholds(thresholds: Sequence[float]) -> None:
@@ -133,13 +168,21 @@ def _check_thresholds(thresholds: Sequence[float]) -> None:
 
 
 def _labels_by_threshold(
-    vectors: np.ndarray, thresholds: Sequence[float]
+    vectors: np.ndarray,
+    thresholds: Sequence[float],
+    *,
+    groups: Sequence[Hashable] | None = None,
 ) -> dict[float, list[int]]:
     """Label rows for each distinct threshold, walking thresholds from high to low."""
     _check_thresholds(thresholds)
     matrix = _finite_matrix(vectors)
+    if groups is not None and len(groups) != len(matrix):
+        raise ValueError("groups must have the same length as vectors")
     distinct = sorted(set(thresholds), reverse=True)
-    similarities, lefts, rights = _collect_edges(matrix, distinct[-1])
+    if groups is None:
+        similarities, lefts, rights = _collect_edges(matrix, distinct[-1])
+    else:
+        similarities, lefts, rights = _collect_cross_edges(matrix, groups, distinct[-1])
     union_find = _UnionFind(len(matrix))
     edge_index = 0
     labels: dict[float, list[int]] = {}
@@ -155,9 +198,14 @@ def _labels_by_threshold(
     return labels
 
 
-def threshold_clusters(vectors: np.ndarray, threshold: float) -> list[int]:
+def threshold_clusters(
+    vectors: np.ndarray,
+    threshold: float,
+    *,
+    groups: Sequence[Hashable] | None = None,
+) -> list[int]:
     """Cluster rows with single-link dot-product similarity."""
-    return _labels_by_threshold(vectors, [threshold])[threshold]
+    return _labels_by_threshold(vectors, [threshold], groups=groups)[threshold]
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,20 +218,48 @@ class SweepRow:
     bcubed: Scores
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceRow:
+    """One reference clustering result."""
+
+    name: str
+    n_clusters: int
+    pairwise: Scores
+    bcubed: Scores
+
+
+def singletons_reference(
+    ids: Sequence[str],
+    gold: Mapping[str, Hashable],
+) -> ReferenceRow:
+    """Score a reference prediction where every item is a singleton."""
+    prediction = {item_id: index for index, item_id in enumerate(ids)}
+    return ReferenceRow(
+        name="singletons",
+        n_clusters=len(ids),
+        pairwise=pairwise_scores(prediction, gold),
+        bcubed=bcubed_scores(prediction, gold),
+    )
+
+
 def sweep(
     ids: Sequence[str],
     vectors: np.ndarray,
     gold: Mapping[str, Hashable],
     thresholds: Sequence[float],
+    *,
+    groups: Sequence[Hashable] | None = None,
 ) -> list[SweepRow]:
     """Sweep thresholds efficiently using a shared similarity matrix."""
     if len(ids) != len(vectors):
         raise ValueError("ids and vectors must have the same length")
+    if groups is not None and len(groups) != len(vectors):
+        raise ValueError("groups must have the same length as vectors")
     if len(set(ids)) != len(ids):
         raise ValueError("ids must be unique")
     if set(ids) != set(gold):
         raise ValueError("ids and gold must contain the same item IDs")
-    labels_by_threshold = _labels_by_threshold(vectors, thresholds)
+    labels_by_threshold = _labels_by_threshold(vectors, thresholds, groups=groups)
 
     rows: list[SweepRow] = []
     for threshold in thresholds:
@@ -210,14 +286,20 @@ class BaselineReport:
     n_events: int
     n_excluded: int
     rows: list[SweepRow]
+    pairs: str | None = None
+    reference: ReferenceRow | None = None
 
 
 def run_baseline(
     events: Iterable[Event],
     embedder: Embedder,
     thresholds: Sequence[float],
+    *,
+    pairs: str = "cross-source",
 ) -> BaselineReport:
     """Embed and evaluate the labeled subset of advisory events."""
+    if pairs not in PAIR_MODES:
+        raise ValueError(f"pairs must be one of {PAIR_MODES}, got {pairs!r}")
     materialized = list(events)
     kept_with_labels = [
         (event, label) for event in materialized if (label := gold_label(event)) is not None
@@ -234,30 +316,65 @@ def run_baseline(
         vectors,
         gold,
         thresholds,
+        groups=[event.source for event in kept] if pairs == "cross-source" else None,
     )
     return BaselineReport(
         embedder=embedder.name,
         n_events=len(kept),
         n_excluded=n_excluded,
         rows=rows,
+        pairs=pairs,
+        reference=singletons_reference([event.event_id for event in kept], gold),
+    )
+
+
+def _table_row(label: str, n_clusters: int, pairwise: Scores, bcubed: Scores, n_events: int) -> str:
+    """Format one table row; pairwise precision is n/a when no pair is predicted."""
+    precision = "n/a" if n_clusters == n_events else f"{pairwise.precision:.3f}"
+    return (
+        f"| {label} | {n_clusters} | {precision} | {pairwise.recall:.3f} "
+        f"| {pairwise.f1:.3f} | {bcubed.precision:.3f} | {bcubed.recall:.3f} "
+        f"| {bcubed.f1:.3f} |"
     )
 
 
 def format_report(report: BaselineReport) -> str:
-    """Format a baseline report as markdown lines."""
+    """Format a baseline report as markdown lines.
+
+    Every cluster a singleton means no predicted pair, so pairwise precision is
+    undefined and shown as n/a (the metrics module stores 1.0 by convention).
+    """
     lines = [
         f"Embedder: {report.embedder}",
         f"Events: {report.n_events} (excluded: {report.n_excluded})",
+    ]
+    if report.pairs is not None:
+        lines.append(f"Pairs: {report.pairs}")
+    lines += [
         "",
         "| threshold | clusters | pairwise P | pairwise R | pairwise F1 | B3 P | B3 R | B3 F1 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    reference = report.reference
+    if reference is not None:
+        lines.append(
+            _table_row(
+                reference.name,
+                reference.n_clusters,
+                reference.pairwise,
+                reference.bcubed,
+                report.n_events,
+            )
+        )
     for row in report.rows:
         lines.append(
-            f"| {row.threshold:.2f} | {row.n_clusters} "
-            f"| {row.pairwise.precision:.3f} | {row.pairwise.recall:.3f} "
-            f"| {row.pairwise.f1:.3f} | {row.bcubed.precision:.3f} "
-            f"| {row.bcubed.recall:.3f} | {row.bcubed.f1:.3f} |"
+            _table_row(
+                f"{row.threshold:.2f}",
+                row.n_clusters,
+                row.pairwise,
+                row.bcubed,
+                report.n_events,
+            )
         )
     return "\n".join(lines)
 
@@ -308,6 +425,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_THRESHOLDS,
         help="Comma-separated similarity thresholds",
     )
+    parser.add_argument(
+        "--pairs",
+        choices=PAIR_MODES,
+        default="cross-source",
+        help="Candidate pair mode: cross-source joins only events from different sources",
+    )
     args = parser.parse_args(argv)
     if not args.events.is_file():
         parser.error(f"events file not found: {args.events}")
@@ -319,7 +442,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         embedder = BgeM3Embedder()
 
     try:
-        report = run_baseline(load_events(args.events), embedder, args.thresholds)
+        report = run_baseline(
+            load_events(args.events),
+            embedder,
+            args.thresholds,
+            pairs=args.pairs,
+        )
     except ValueError as exc:
         parser.error(str(exc))
     print(format_report(report))
@@ -328,13 +456,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "DEFAULT_THRESHOLDS",
+    "PAIR_MODES",
     "BaselineReport",
+    "ReferenceRow",
     "SweepRow",
     "format_report",
     "gold_label",
     "load_events",
     "main",
     "run_baseline",
+    "singletons_reference",
     "sweep",
     "threshold_clusters",
 ]

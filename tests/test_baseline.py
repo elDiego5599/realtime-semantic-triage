@@ -8,6 +8,7 @@ import pytest
 
 from semtriage.baseline import (
     DEFAULT_THRESHOLDS,
+    PAIR_MODES,
     BaselineReport,
     SweepRow,
     format_report,
@@ -15,6 +16,7 @@ from semtriage.baseline import (
     load_events,
     main,
     run_baseline,
+    singletons_reference,
     sweep,
     threshold_clusters,
 )
@@ -25,10 +27,12 @@ from semtriage.sanitize import sanitize
 WHEN = datetime(2024, 5, 1, tzinfo=UTC)
 
 
-def make_event(source_id: str, text: str, cve_ids: tuple[str, ...]) -> Event:
+def make_event(
+    source_id: str, text: str, cve_ids: tuple[str, ...], source: Source = Source.NVD
+) -> Event:
     return Event(
-        event_id=f"nvd:{source_id}",
-        source=Source.NVD,
+        event_id=f"{source.value}:{source_id}",
+        source=source,
         source_id=source_id,
         published=WHEN,
         modified=WHEN,
@@ -164,7 +168,12 @@ class RecordingEmbedder:
 def sample_events() -> list[Event]:
     return [
         make_event("1", "CVE-2024-0001: heap overflow in libfoo", ("CVE-2024-0001",)),
-        make_event("2", "Heap overflow in libfoo (GHSA-abcd-efgh-ijkl)", ("CVE-2024-0001",)),
+        make_event(
+            "2",
+            "Heap overflow in libfoo (GHSA-abcd-efgh-ijkl)",
+            ("CVE-2024-0001",),
+            Source.GHSA,
+        ),
         make_event("3", "XSS in admin page", ("CVE-2024-0002",)),
         make_event("4", "Bundle of fixes", ("CVE-2024-0003", "CVE-2024-0004")),
         make_event("5", "No identifier at all", ()),
@@ -434,4 +443,199 @@ def test_main_non_utf8_events_is_a_usage_error(tmp_path):
     path.write_bytes(b"\xff\xfe not utf-8\n")
     with pytest.raises(SystemExit) as excinfo:
         main(["--events", str(path)])
+    assert excinfo.value.code == 2
+
+
+# Cross-source pairs and singleton reference
+
+
+def _brute_force_cross_labels(vectors, threshold, groups):
+    sims = vectors.astype(np.float64) @ vectors.astype(np.float64).T
+    groups = np.asarray(groups, dtype=object)
+    n = len(vectors)
+    labels = list(range(n))
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            for j in np.nonzero((sims[i] >= threshold) & (groups != groups[i]))[0]:
+                low = min(labels[i], labels[j])
+                if labels[i] != low or labels[j] != low:
+                    labels[i] = labels[j] = low
+                    changed = True
+    return labels
+
+
+def test_cross_source_never_joins_identical_same_source_rows():
+    vectors = np.array([A, A, A, C])
+    groups = ["nvd", "nvd", "nvd", "ghsa"]
+    assert threshold_clusters(vectors, 0.9, groups=groups) == [0, 1, 2, 3]
+    assert threshold_clusters(vectors, -1.0, groups=groups) == [0, 0, 0, 0]
+    assert threshold_clusters(np.array([A, A]), 0.9, groups=["nvd", "nvd"]) == [0, 1]
+
+
+def test_cross_source_joins_through_other_source():
+    vectors = np.array([A, A, A])
+    assert threshold_clusters(vectors, 0.9, groups=["nvd", "ghsa", "nvd"]) == [0, 0, 0]
+
+
+def test_groups_none_keeps_all_pairs_behavior():
+    vectors = np.array([A, A, C])
+    assert threshold_clusters(vectors, 0.9) == [0, 0, 2]
+    assert threshold_clusters(vectors, 0.9, groups=None) == [0, 0, 2]
+
+
+def test_single_group_gives_singletons():
+    vectors = np.array([A, A, B])
+    assert threshold_clusters(vectors, -1.0, groups=["x", "x", "x"]) == [0, 1, 2]
+    assert threshold_clusters(np.array([A]), 0.5, groups=["x"]) == [0]
+    assert threshold_clusters(np.zeros((0, 2)), 0.5, groups=[]) == []
+
+
+@pytest.mark.parametrize("n_groups", [2, 3])
+def test_cross_source_matches_brute_force_across_row_blocks(n_groups):
+    rng = np.random.default_rng(9)
+    base = rng.normal(size=(50, 6))
+    picks = rng.integers(0, 50, size=1300)
+    vectors = base[picks] + rng.normal(scale=0.05, size=(1300, 6))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    # Unbalanced groups, interleaved in row order.
+    groups = [Source.GHSA if i % 7 == 0 else Source.NVD for i in range(1300)]
+    if n_groups == 3:
+        groups = [g if i % 11 else "osv" for i, g in enumerate(groups)]
+    for threshold in (0.995, 0.97):
+        expected = _brute_force_cross_labels(vectors, threshold, groups)
+        assert threshold_clusters(vectors, threshold, groups=groups) == expected
+
+
+def test_sweep_with_groups_matches_threshold_clusters():
+    rng = np.random.default_rng(13)
+    vectors = rng.normal(size=(60, 5))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    ids = [f"e{i}" for i in range(60)]
+    groups = ["nvd" if i % 3 else "ghsa" for i in range(60)]
+    gold = {item_id: f"CVE-{i % 9}" for i, item_id in enumerate(ids)}
+    thresholds = [0.9, 0.4, 0.0, -1.0]
+    rows = sweep(ids, vectors, gold, thresholds, groups=groups)
+    for row, threshold in zip(rows, thresholds, strict=True):
+        labels = threshold_clusters(vectors, threshold, groups=groups)
+        pred = dict(zip(ids, labels, strict=True))
+        assert row.n_clusters == len(set(labels))
+        assert row.pairwise == pairwise_scores(pred, gold)
+        assert row.bcubed == bcubed_scores(pred, gold)
+
+
+def test_groups_length_mismatch_raises():
+    with pytest.raises(ValueError, match="groups"):
+        threshold_clusters(ABC, 0.5, groups=["nvd", "ghsa"])
+    with pytest.raises(ValueError, match="groups"):
+        sweep(["a", "b", "c"], ABC, {"a": 1, "b": 1, "c": 1}, [0.5], groups=["nvd"])
+
+
+def test_singletons_reference_hand_computed():
+    gold = {"a": "X", "b": "X", "c": "Y"}
+    reference = singletons_reference(["a", "b", "c"], gold)
+    assert reference.name == "singletons"
+    assert reference.n_clusters == 3
+    # Pairwise precision is undefined (no predicted pairs); metrics report 1.0 by convention.
+    assert reference.pairwise == Scores(precision=1.0, recall=0.0, f1=0.0)
+    assert reference.bcubed.precision == 1.0
+    assert reference.bcubed.recall == pytest.approx(2 / 3)
+    assert reference.bcubed.f1 == pytest.approx(0.8)
+
+
+def test_pair_modes():
+    assert PAIR_MODES == ("cross-source", "all")
+
+
+def test_run_baseline_default_is_cross_source_with_reference():
+    events = [
+        make_event("1", "heap overflow in libfoo", ("CVE-2024-0001",)),
+        make_event("2", "heap overflow in libfoo again", ("CVE-2024-0001",)),
+        make_event("3", "XSS in admin page", ("CVE-2024-0002",)),
+    ]
+    report = run_baseline(events, RecordingEmbedder(), [0.9])
+    assert report.pairs == "cross-source"
+    assert report.rows[0].n_clusters == 3
+    assert report.reference == singletons_reference(
+        ["nvd:1", "nvd:2", "nvd:3"],
+        {"nvd:1": "CVE-2024-0001", "nvd:2": "CVE-2024-0001", "nvd:3": "CVE-2024-0002"},
+    )
+    all_report = run_baseline(events, RecordingEmbedder(), [0.9], pairs="all")
+    assert all_report.pairs == "all"
+    assert all_report.rows[0].n_clusters == 2
+    assert all_report.rows[0].pairwise == Scores(precision=1.0, recall=1.0, f1=1.0)
+    assert all_report.reference == report.reference
+
+
+def test_run_baseline_rejects_unknown_pairs():
+    with pytest.raises(ValueError, match="pairs"):
+        run_baseline(sample_events(), RecordingEmbedder(), [0.5], pairs="same-source")
+
+
+def test_format_report_shows_pairs_reference_and_na():
+    reference = singletons_reference(["a", "b", "c"], {"a": "X", "b": "X", "c": "Y"})
+    report = BaselineReport(
+        embedder="hashing-256",
+        n_events=3,
+        n_excluded=0,
+        rows=[
+            SweepRow(
+                threshold=0.95,
+                n_clusters=3,
+                pairwise=Scores(precision=1.0, recall=0.0, f1=0.0),
+                bcubed=reference.bcubed,
+            ),
+            SweepRow(
+                threshold=0.5,
+                n_clusters=2,
+                pairwise=Scores(precision=1.0, recall=1.0, f1=1.0),
+                bcubed=Scores(precision=1.0, recall=1.0, f1=1.0),
+            ),
+        ],
+        pairs="cross-source",
+        reference=reference,
+    )
+    lines = format_report(report).splitlines()
+    assert "Pairs: cross-source" in lines
+    ref_line = "| singletons | 3 | n/a | 0.000 | 0.000 | 1.000 | 0.667 | 0.800 |"
+    assert ref_line in lines
+    assert lines.index(ref_line) < lines.index(
+        "| 0.50 | 2 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |"
+    )
+    assert lines[lines.index(ref_line) - 1].startswith("|---")
+    assert "| 0.95 | 3 | n/a | 0.000 | 0.000 | 1.000 | 0.667 | 0.800 |" in lines
+
+
+def test_format_report_without_pairs_or_reference_has_no_extra_lines():
+    report = BaselineReport(embedder="e", n_events=1, n_excluded=0, rows=[])
+    text = format_report(report)
+    assert "Pairs:" not in text
+    assert "singletons" not in text
+
+
+def test_main_pairs_option(tmp_path, capsys):
+    events = [
+        make_event("1", "heap overflow in libfoo", ("CVE-2024-0001",)),
+        make_event("2", "heap overflow in libfoo again", ("CVE-2024-0001",)),
+        make_event("3", "XSS in admin page", ("CVE-2024-0002",)),
+    ]
+    path = tmp_path / "events.jsonl"
+    write_jsonl(path, events)
+    assert main(["--events", str(path), "--thresholds", "-1"]) == 0
+    out = capsys.readouterr().out
+    assert "Pairs: cross-source" in out
+    assert "| -1.00 | 3 |" in out
+    assert "| singletons | 3 |" in out
+    assert main(["--events", str(path), "--thresholds", "-1", "--pairs", "all"]) == 0
+    out = capsys.readouterr().out
+    assert "Pairs: all" in out
+    assert "| -1.00 | 1 |" in out
+
+
+def test_main_rejects_unknown_pairs(tmp_path):
+    path = tmp_path / "events.jsonl"
+    write_jsonl(path, sample_events())
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--events", str(path), "--pairs", "same-source"])
     assert excinfo.value.code == 2
