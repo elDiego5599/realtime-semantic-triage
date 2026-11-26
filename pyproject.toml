@@ -31,3 +31,4 @@ lint = { select = ["E", "F", "I", "UP", "B"], isort = { known-first-party = ["se
 
 [project.scripts]
 semtriage-backfill = "semtriage.backfill:cli"
+semtriage-dataset = "semtriage.dataset:cli"
