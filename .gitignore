@@ -15,3 +15,8 @@ dist/
 .env
 .DS_Store
 .copilot-runs/
+
+# Private planning notes, kept local
+MASTER_PLAN.md
+docs/tower-setup.md
+docs/briefs/
