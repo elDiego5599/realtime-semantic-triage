@@ -64,3 +64,99 @@ def test_find_identifiers_inside_urls():
 def test_empty_input():
     assert sanitize("") == ""
     assert find_identifiers("") == set()
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("see test_CVE-2026-12345.py and fix_GHSA-crj3-q72p-ggqm", "see test_.py and fix_"),
+        ("CVE-2026-12345abc", "abc"),
+    ],
+)
+def test_strips_identifiers_next_to_underscore_or_letters(text, expected):
+    assert sanitize(text) == expected
+
+
+def test_find_identifiers_next_to_underscore_or_letters():
+    text = "see test_CVE-2026-12345.py and fix_GHSA-crj3-q72p-ggqm, CVE-2026-54321abc"
+    assert find_identifiers(text) == {
+        "CVE-2026-12345",
+        "CVE-2026-54321",
+        "GHSA-CRJ3-Q72P-GGQM",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["XCVE-2026-12345", "1CVE-2026-12345", "aGHSA-crj3-q72p-ggqm", "GHSA-crj3-q72p-ggqmx"],
+)
+def test_identifiers_glued_to_alphanumerics_are_not_identifiers(text):
+    assert find_identifiers(text) == set()
+
+
+@pytest.mark.parametrize("dash", [chr(c) for c in range(0x2010, 0x2016)])
+def test_unicode_dashes_inside_identifiers(dash):
+    text = f"x CVE{dash}2026{dash}12345 y GHSA{dash}crj3{dash}q72p-ggqm z"
+    assert find_identifiers(text) == {"CVE-2026-12345", "GHSA-CRJ3-Q72P-GGQM"}
+    assert sanitize(text) == "x y z"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("[advisory](https://x.test/a)and more", "advisoryand more"),
+        ("[advisory](https://x.test/a) and more", "advisory and more"),
+        ("<https://x.test/a>", ""),
+        ("See <https://x.test/a> now", "See now"),
+        ("Read **https://x.test/a** now", "Read now"),
+        ("Wiki https://x.test/Foo_(bar) page", "Wiki page"),
+        ("(https://x.test/Foo_(bar))", ""),
+        ('href="https://x.test/a">link', 'href="">link'),
+        ("[CVE-2026-12345](https://nvd.nist.gov/vuln/detail/CVE-2026-12345) fixed", "fixed"),
+    ],
+)
+def test_url_boundaries_and_markup_artifacts(text, expected):
+    assert sanitize(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("([CVE-2026-12345])", ""),
+        ("Bug (CVE-2026-12345, GHSA-crj3-q72p-ggqm) fixed", "Bug fixed"),
+        ("(CVE-2026-12345 ; CVE-2026-12346 :)", ""),
+        ("Call foo() with CVE-2026-12345 here", "Call foo() with here"),
+    ],
+)
+def test_removes_nested_and_punctuation_only_brackets(text, expected):
+    assert sanitize(text) == expected
+
+
+def test_keeps_empty_brackets_that_were_already_in_clean_text():
+    text = "Call f() and g[] and h(, ) as before."
+    assert sanitize(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "CVE-2026-(CVE-2025-11111)12345",
+        "GHSA-crj3-<GHSA-aaaa-bbbb-cccc>q72p-ggqm",
+        "CVE-2026-[https://x.test/a]12345",
+    ],
+)
+def test_removal_cannot_join_text_into_a_new_identifier(text):
+    assert find_identifiers(sanitize(text)) == set()
+
+
+def test_bold_cleanup_does_not_span_separate_bold_runs():
+    text = "**Note:** CVE-2026-12345 **Severity:** high"
+    assert sanitize(text) == "**Note:** **Severity:** high"
+
+
+def test_url_does_not_include_trailing_brace():
+    assert sanitize("{https://x.test/a}") == "{}"
+
+
+def test_find_identifiers_only_matches_ascii_digits():
+    assert find_identifiers("CVE-٢٠٢٦-١٢٣٤٥") == set()
