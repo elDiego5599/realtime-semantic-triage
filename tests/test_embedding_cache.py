@@ -9,6 +9,7 @@ from semtriage.baseline import (
     main,
     read_embeddings,
     run_baseline,
+    texts_sha256,
     write_embeddings,
 )
 from semtriage.embed import HashingEmbedder
@@ -50,14 +51,15 @@ def write_jsonl(path, events: list[Event]) -> None:
 
 
 KEPT_IDS = ["nvd:1", "ghsa:2", "nvd:3"]
+KEPT_TEXTS = ["first text", "second text", "third text"]
 
 
 def test_save_and_load_round_trip(tmp_path):
     path = tmp_path / "vectors.npz"
     vectors = np.arange(6, dtype=np.float64).reshape(3, 2)
-    write_embeddings(path, KEPT_IDS, vectors, embedder="e1")
+    write_embeddings(path, KEPT_IDS, KEPT_TEXTS, vectors, embedder="e1")
     assert path.exists()
-    loaded, name = read_embeddings(path, KEPT_IDS)
+    loaded, name = read_embeddings(path, KEPT_IDS, KEPT_TEXTS)
     assert name == "e1"
     assert loaded.dtype == np.float32
     np.testing.assert_array_equal(loaded, vectors.astype(np.float32))
@@ -65,14 +67,14 @@ def test_save_and_load_round_trip(tmp_path):
 
 def test_save_keeps_exact_path_without_npz_suffix(tmp_path):
     path = tmp_path / "vectors.bin"
-    write_embeddings(path, KEPT_IDS, np.zeros((3, 2)), embedder="e1")
+    write_embeddings(path, KEPT_IDS, KEPT_TEXTS, np.zeros((3, 2)), embedder="e1")
     assert path.exists()
     assert not (tmp_path / "vectors.bin.npz").exists()
 
 
 def test_save_rejects_row_mismatch(tmp_path):
     with pytest.raises(ValueError, match="rows"):
-        write_embeddings(tmp_path / "v.npz", KEPT_IDS, np.zeros((2, 2)), embedder="e1")
+        write_embeddings(tmp_path / "v.npz", KEPT_IDS, KEPT_TEXTS, np.zeros((2, 2)), embedder="e1")
 
 
 @pytest.mark.parametrize(
@@ -86,9 +88,9 @@ def test_save_rejects_row_mismatch(tmp_path):
 )
 def test_load_rejects_id_mismatch(tmp_path, ids):
     path = tmp_path / "vectors.npz"
-    write_embeddings(path, KEPT_IDS, np.zeros((3, 2)), embedder="e1")
+    write_embeddings(path, KEPT_IDS, KEPT_TEXTS, np.zeros((3, 2)), embedder="e1")
     with pytest.raises(ValueError, match="event ids"):
-        read_embeddings(path, ids)
+        read_embeddings(path, ids, KEPT_TEXTS)
 
 
 @pytest.mark.parametrize(
@@ -101,22 +103,28 @@ def test_load_rejects_id_mismatch(tmp_path, ids):
 )
 def test_load_rejects_bad_shapes(tmp_path, event_ids, vectors):
     path = tmp_path / "vectors.npz"
-    np.savez(path, event_ids=event_ids, vectors=vectors, embedder=np.array("e1"))
+    np.savez(
+        path,
+        event_ids=event_ids,
+        vectors=vectors,
+        embedder=np.array("e1"),
+        text_sha256=np.array(texts_sha256(KEPT_TEXTS)),
+    )
     with pytest.raises(ValueError, match="shape"):
-        read_embeddings(path, KEPT_IDS)
+        read_embeddings(path, KEPT_IDS, KEPT_TEXTS)
 
 
 def test_load_rejects_missing_keys_and_garbage(tmp_path):
     path = tmp_path / "vectors.npz"
     np.savez(path, vectors=np.zeros((3, 2)))
     with pytest.raises(ValueError, match="missing"):
-        read_embeddings(path, KEPT_IDS)
+        read_embeddings(path, KEPT_IDS, KEPT_TEXTS)
     garbage = tmp_path / "garbage.npz"
     garbage.write_bytes(b"not a zip")
     with pytest.raises(ValueError, match="garbage.npz"):
-        read_embeddings(garbage, KEPT_IDS)
+        read_embeddings(garbage, KEPT_IDS, KEPT_TEXTS)
     with pytest.raises(ValueError, match="nope.npz"):
-        read_embeddings(tmp_path / "nope.npz", KEPT_IDS)
+        read_embeddings(tmp_path / "nope.npz", KEPT_IDS, KEPT_TEXTS)
 
 
 class FailingEmbedder:
@@ -170,7 +178,9 @@ def test_main_load_rejects_mismatch_with_exit_2(tmp_path, capsys):
     events_path = tmp_path / "events.jsonl"
     write_jsonl(events_path, sample_events())
     cache = tmp_path / "vectors.npz"
-    write_embeddings(cache, ["nvd:1", "nvd:3", "ghsa:2"], np.zeros((3, 2)), embedder="e1")
+    write_embeddings(
+        cache, ["nvd:1", "nvd:3", "ghsa:2"], KEPT_TEXTS, np.zeros((3, 2)), embedder="e1"
+    )
     with pytest.raises(SystemExit) as excinfo:
         main(["--events", str(events_path), "--load-embeddings", str(cache)])
     assert excinfo.value.code == 2
@@ -223,3 +233,49 @@ def test_help_lists_new_flags(capsys):
     out = capsys.readouterr().out
     for flag in ("--save-embeddings", "--load-embeddings", "--fp16"):
         assert flag in out
+
+
+def test_texts_sha256_is_unambiguous():
+    assert texts_sha256(["ab", "c"]) != texts_sha256(["a", "bc"])
+    assert texts_sha256(["a\x00", ""]) != texts_sha256(["a", "\x00"])
+    assert texts_sha256([]) != texts_sha256([""])
+    assert len(texts_sha256(["x"])) == 64
+
+
+def test_save_rejects_text_count_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="texts"):
+        write_embeddings(tmp_path / "v.npz", KEPT_IDS, ["a"], np.zeros((3, 2)), embedder="e1")
+
+
+def test_load_rejects_stale_texts(tmp_path):
+    path = tmp_path / "vectors.npz"
+    write_embeddings(path, KEPT_IDS, KEPT_TEXTS, np.zeros((3, 2)), embedder="e1")
+    with pytest.raises(ValueError, match="sanitized texts"):
+        read_embeddings(path, KEPT_IDS, ["first text", "second text", "changed"])
+
+
+def test_load_rejects_file_without_text_hash(tmp_path):
+    path = tmp_path / "vectors.npz"
+    np.savez(
+        path,
+        event_ids=np.array(KEPT_IDS),
+        vectors=np.zeros((3, 2), dtype=np.float32),
+        embedder=np.array("e1"),
+    )
+    with pytest.raises(ValueError, match="text_sha256"):
+        read_embeddings(path, KEPT_IDS, KEPT_TEXTS)
+
+
+def test_main_load_rejects_stale_texts_with_exit_2(tmp_path, capsys):
+    events_path = tmp_path / "events.jsonl"
+    write_jsonl(events_path, sample_events())
+    cache = tmp_path / "vectors.npz"
+    assert main(["--events", str(events_path), "--save-embeddings", str(cache)]) == 0
+    capsys.readouterr()
+    changed = sample_events()
+    changed[0] = changed[0].model_copy(update={"text": "heap overflow in libfoo, edited"})
+    write_jsonl(events_path, changed)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--events", str(events_path), "--load-embeddings", str(cache)])
+    assert excinfo.value.code == 2
+    assert "sanitized texts" in capsys.readouterr().err

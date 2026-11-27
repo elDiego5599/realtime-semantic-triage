@@ -1,6 +1,7 @@
 """Offline advisory deduplication baseline and reporting."""
 
 import argparse
+import hashlib
 import math
 import zipfile
 from collections.abc import Hashable, Iterable, Mapping, Sequence
@@ -163,6 +164,25 @@ def _collect_cross_edges(
     return _sorted_edges(similarity_parts, left_parts, right_parts)
 
 
+def candidate_edges(
+    vectors: np.ndarray,
+    minimum_threshold: float,
+    *,
+    groups: Sequence[Hashable] | None = None,
+) -> _Edges:
+    """Return (similarities, lefts, rights) of candidate edges at or above a threshold.
+
+    Edges are ordered by descending similarity, with left < right. With `groups`,
+    only rows from different groups are paired.
+    """
+    matrix = _finite_matrix(vectors)
+    if groups is not None and len(groups) != len(matrix):
+        raise ValueError("groups must have the same length as vectors")
+    if groups is None:
+        return _collect_edges(matrix, minimum_threshold)
+    return _collect_cross_edges(matrix, groups, minimum_threshold)
+
+
 def _check_thresholds(thresholds: Sequence[float]) -> None:
     """Reject an empty or non-finite threshold sequence."""
     if len(thresholds) == 0:
@@ -179,15 +199,9 @@ def _labels_by_threshold(
 ) -> dict[float, list[int]]:
     """Label rows for each distinct threshold, walking thresholds from high to low."""
     _check_thresholds(thresholds)
-    matrix = _finite_matrix(vectors)
-    if groups is not None and len(groups) != len(matrix):
-        raise ValueError("groups must have the same length as vectors")
     distinct = sorted(set(thresholds), reverse=True)
-    if groups is None:
-        similarities, lefts, rights = _collect_edges(matrix, distinct[-1])
-    else:
-        similarities, lefts, rights = _collect_cross_edges(matrix, groups, distinct[-1])
-    union_find = _UnionFind(len(matrix))
+    similarities, lefts, rights = candidate_edges(vectors, distinct[-1], groups=groups)
+    union_find = _UnionFind(len(vectors))
     edge_index = 0
     labels: dict[float, list[int]] = {}
     for threshold in distinct:
@@ -200,6 +214,14 @@ def _labels_by_threshold(
             edge_index += 1
         labels[threshold] = union_find.labels()
     return labels
+
+
+def edge_clusters(n_rows: int, lefts: np.ndarray, rights: np.ndarray) -> list[int]:
+    """Label rows by the connected components of the given edges (smallest index wins)."""
+    union_find = _UnionFind(n_rows)
+    for left, right in zip(lefts.tolist(), rights.tolist(), strict=True):
+        union_find.union(left, right)
+    return union_find.labels()
 
 
 def threshold_clusters(
@@ -307,34 +329,60 @@ def labeled_events(events: Iterable[Event]) -> tuple[list[Event], dict[str, str]
     return kept, gold, len(materialized) - len(kept)
 
 
+def texts_sha256(texts: Sequence[str]) -> str:
+    """Hex sha256 over the texts in order, each prefixed by its UTF-8 byte length."""
+    digest = hashlib.sha256(len(texts).to_bytes(8, "big"))
+    for text in texts:
+        encoded = text.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
 def write_embeddings(
     path: str | Path,
     ids: Sequence[str],
+    texts: Sequence[str],
     vectors: np.ndarray,
     *,
     embedder: str,
 ) -> None:
-    """Save event ids, float32 vectors and the embedder name to one .npz file at `path`."""
+    """Save event ids, a hash of the embedded texts, float32 vectors and the embedder name.
+
+    `texts` are the exact (sanitized) texts that were embedded, in the order of `ids`.
+    Everything goes to one .npz file at `path`.
+    """
     matrix = np.asarray(vectors, dtype=np.float32)
     if matrix.ndim != 2 or len(matrix) != len(ids):
         raise ValueError(f"vectors must be 2-D with {len(ids)} rows, got shape {matrix.shape}")
+    if len(texts) != len(ids):
+        raise ValueError(f"expected {len(ids)} texts, got {len(texts)}")
     with Path(path).open("wb") as target:
         np.savez(
             target,
             event_ids=np.asarray(list(ids), dtype=str),
             vectors=matrix,
             embedder=np.asarray(embedder, dtype=str),
+            text_sha256=np.asarray(texts_sha256(texts), dtype=str),
         )
 
 
-def read_embeddings(path: str | Path, ids: Sequence[str]) -> tuple[np.ndarray, str]:
-    """Load cached vectors, refusing them unless their event ids equal `ids` in order."""
+def read_embeddings(
+    path: str | Path,
+    ids: Sequence[str],
+    texts: Sequence[str],
+) -> tuple[np.ndarray, str]:
+    """Load cached vectors, refusing them unless both ids and texts match what was saved.
+
+    `ids` must equal the stored event ids in order, and `texts` (the sanitized texts
+    of those events) must hash to the stored digest, so stale vectors are never reused.
+    """
     try:
         with np.load(Path(path), allow_pickle=False) as data:
             arrays = {key: data[key] for key in data.files}
     except (OSError, ValueError, AttributeError, zipfile.BadZipFile, EOFError) as exc:
         raise ValueError(f"{path}: cannot read embeddings file ({exc})") from exc
-    missing = {"event_ids", "vectors", "embedder"} - set(arrays)
+    missing = {"event_ids", "vectors", "embedder", "text_sha256"} - set(arrays)
     if missing:
         raise ValueError(f"{path}: embeddings file is missing {sorted(missing)}")
     stored_ids, vectors = arrays["event_ids"], arrays["vectors"]
@@ -347,6 +395,11 @@ def read_embeddings(path: str | Path, ids: Sequence[str]) -> tuple[np.ndarray, s
         raise ValueError(
             f"{path}: event ids do not match the labeled events "
             f"({len(stored_ids)} stored, {len(ids)} expected, same order required)"
+        )
+    if str(arrays["text_sha256"]) != texts_sha256(texts):
+        raise ValueError(
+            f"{path}: sanitized texts differ from the ones embedded "
+            "(stale cache, for example after a sanitize change); re-embed"
         )
     return vectors.astype(np.float32, copy=False), embedder
 
@@ -369,14 +422,15 @@ def run_baseline(
     if not kept:
         raise ValueError("No labeled events to evaluate")
     ids = [event.event_id for event in kept]
+    texts = [sanitize(event.text) for event in kept]
 
     if embedder is None:
-        vectors, embedder_name = read_embeddings(load_embeddings, ids)
+        vectors, embedder_name = read_embeddings(load_embeddings, ids, texts)
     else:
-        vectors = embedder.embed([sanitize(event.text) for event in kept])
+        vectors = embedder.embed(texts)
         embedder_name = embedder.name
     if save_embeddings is not None:
-        write_embeddings(save_embeddings, ids, vectors, embedder=embedder_name)
+        write_embeddings(save_embeddings, ids, texts, vectors, embedder=embedder_name)
     rows = sweep(
         ids,
         vectors,
@@ -551,6 +605,8 @@ __all__ = [
     "BaselineReport",
     "ReferenceRow",
     "SweepRow",
+    "candidate_edges",
+    "edge_clusters",
     "format_report",
     "gold_label",
     "labeled_events",
@@ -560,6 +616,7 @@ __all__ = [
     "run_baseline",
     "singletons_reference",
     "sweep",
+    "texts_sha256",
     "threshold_clusters",
     "write_embeddings",
 ]

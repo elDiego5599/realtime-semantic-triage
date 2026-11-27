@@ -10,16 +10,24 @@ import numpy as np
 
 from semtriage.baseline import (
     PAIR_MODES,
+    candidate_edges,
+    edge_clusters,
     labeled_events,
     load_events,
     read_embeddings,
-    threshold_clusters,
 )
 from semtriage.models import Event
 from semtriage.sanitize import sanitize
 
 QUANTILES: tuple[float, ...] = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
 SHARED_FIELDS: tuple[str, ...] = ("package", "ecosystem", "cwe", "cna", "any")
+SIZE_BUCKETS: tuple[tuple[str, int, int], ...] = (
+    ("1", 1, 1),
+    ("2", 2, 2),
+    ("3", 3, 3),
+    ("4-10", 4, 10),
+    (">10", 11, 2**62),
+)
 SAMPLE_CHARS = 300
 MAX_PAIRS = 50_000_000
 _DOT_CHUNK = 8192
@@ -40,7 +48,13 @@ class PairSample:
 
 @dataclass(frozen=True, slots=True)
 class ErrorReport:
-    """False merges and missed duplicates of the baseline at one threshold."""
+    """False merges and missed duplicates of the baseline at one threshold.
+
+    `*_false_merge*` and `n_true_pairs` count pairs inside predicted clusters, so
+    they include pairs joined only by single-link chaining. `*_false_edge*` count
+    candidate edges at or above the threshold whose events have different gold
+    labels: the direct model errors.
+    """
 
     threshold: float
     pairs: str
@@ -48,14 +62,20 @@ class ErrorReport:
     n_excluded: int
     n_true_pairs: int
     n_false_merges: int
+    n_false_edges: int
     n_missed: int
     missed_same_source: int
     false_merge_shares: dict[str, float]
+    false_edge_shares: dict[str, float]
     false_merge_quantiles: dict[float, float]
+    false_edge_quantiles: dict[float, float]
     true_pair_quantiles: dict[float, float]
     missed_quantiles: dict[float, float]
     missed_length_quantiles: dict[str, dict[float, float]]
+    cluster_sizes: dict[str, int]
+    largest_cluster: int
     false_merge_samples: list[PairSample]
+    false_edge_samples: list[PairSample]
     missed_samples: list[PairSample]
     embedder: str | None = None
 
@@ -149,6 +169,16 @@ def _select(pairs: _Pairs, mask: np.ndarray) -> _Pairs:
     return pairs[0][mask], pairs[1][mask]
 
 
+def _cluster_sizes(labels: np.ndarray) -> tuple[dict[str, int], int]:
+    """Count clusters per size bucket and return the largest cluster size."""
+    sizes = np.bincount(labels) if len(labels) else np.zeros(0, dtype=np.int64)
+    sizes = sizes[sizes > 0]
+    buckets = {
+        name: int(np.sum((sizes >= low) & (sizes <= high))) for name, low, high in SIZE_BUCKETS
+    }
+    return buckets, int(sizes.max()) if len(sizes) else 0
+
+
 def analyze_errors(
     events: Iterable[Event],
     vectors: np.ndarray,
@@ -162,7 +192,8 @@ def analyze_errors(
     """Cluster the labeled events at threshold and describe where it disagrees with gold.
 
     `vectors` holds one row per labeled event, in the order `labeled_events` keeps them.
-    Predicted pairs are all pairs in one predicted cluster, as in the pairwise metric.
+    Predicted pairs are all pairs in one predicted cluster, as in the pairwise metric;
+    direct false edges are the candidate edges themselves that join different labels.
     """
     if pairs not in PAIR_MODES:
         raise ValueError(f"pairs must be one of {PAIR_MODES}, got {pairs!r}")
@@ -173,8 +204,14 @@ def analyze_errors(
     if matrix.ndim != 2 or len(matrix) != len(kept):
         raise ValueError(f"vectors must be 2-D with {len(kept)} rows, got shape {matrix.shape}")
     groups = [event.source for event in kept] if pairs == "cross-source" else None
-    predicted = np.asarray(threshold_clusters(matrix, threshold, groups=groups), dtype=np.int64)
+    edge_sims, edge_lefts, edge_rights = candidate_edges(matrix, threshold, groups=groups)
+    predicted = np.asarray(edge_clusters(len(kept), edge_lefts, edge_rights), dtype=np.int64)
     _, gold_codes = np.unique([gold[event.event_id] for event in kept], return_inverse=True)
+    cluster_sizes, largest_cluster = _cluster_sizes(predicted)
+
+    false_edge_mask = gold_codes[edge_lefts] != gold_codes[edge_rights]
+    false_edges = (edge_lefts[false_edge_mask], edge_rights[false_edge_mask])
+    false_edge_sims = edge_sims[false_edge_mask]
 
     predicted_pairs = _pairs_within(predicted)
     same_gold = gold_codes[predicted_pairs[0]] == gold_codes[predicted_pairs[1]]
@@ -198,17 +235,23 @@ def analyze_errors(
         n_excluded=n_excluded,
         n_true_pairs=len(true_sims),
         n_false_merges=len(false_sims),
+        n_false_edges=len(false_edge_sims),
         n_missed=len(missed_sims),
         missed_same_source=int(np.sum(sources[missed_pairs[0]] == sources[missed_pairs[1]])),
         false_merge_shares=_shares(kept, false_pairs),
+        false_edge_shares=_shares(kept, false_edges),
         false_merge_quantiles=_quantiles(false_sims),
+        false_edge_quantiles=_quantiles(false_edge_sims),
         true_pair_quantiles=_quantiles(true_sims),
         missed_quantiles=_quantiles(missed_sims),
         missed_length_quantiles={
             "shorter": _quantiles(np.minimum(missed_left, missed_right)),
             "longer": _quantiles(np.maximum(missed_left, missed_right)),
         },
+        cluster_sizes=cluster_sizes,
+        largest_cluster=largest_cluster,
         false_merge_samples=_samples(kept, texts, false_pairs, false_sims, samples, rng),
+        false_edge_samples=_samples(kept, texts, false_edges, false_edge_sims, samples, rng),
         missed_samples=_samples(kept, texts, missed_pairs, missed_sims, samples, rng),
         embedder=embedder,
     )
@@ -247,21 +290,36 @@ def format_error_report(report: ErrorReport) -> str:
         f"Pairs: {report.pairs}",
         f"Threshold: {report.threshold:.2f}",
         "",
-        f"True pairs: {report.n_true_pairs}",
-        f"False merges: {report.n_false_merges}",
+        f"Direct false edges: {report.n_false_edges}",
+        f"True pairs (pairs inside predicted clusters): {report.n_true_pairs}",
+        f"False merges (pairs inside predicted clusters): {report.n_false_merges}",
         f"Missed duplicates: {report.n_missed} (same source: {report.missed_same_source})",
         "",
-        "## False merges sharing a field",
+        "## Predicted cluster sizes",
         "",
-        "| field | share |",
+        "| size | clusters |",
         "|---|---:|",
     ]
-    lines += [f"| {field} | {share:.3f} |" for field, share in report.false_merge_shares.items()]
+    lines += [f"| {size} | {count} |" for size, count in report.cluster_sizes.items()]
+    lines += [
+        "",
+        f"Largest cluster: {report.largest_cluster}",
+        "",
+        "## Share of false pairs sharing a field",
+        "",
+        "| field | direct false edges | false merges (pairs inside predicted clusters) |",
+        "|---|---:|---:|",
+    ]
+    lines += [
+        f"| {field} | {report.false_edge_shares[field]:.3f} | {share:.3f} |"
+        for field, share in report.false_merge_shares.items()
+    ]
     lines += ["", "## Similarity quantiles", ""]
     lines += _quantile_table(
         [
-            ("false merges", report.false_merge_quantiles),
-            ("true pairs", report.true_pair_quantiles),
+            ("direct false edges", report.false_edge_quantiles),
+            ("false merges (pairs inside predicted clusters)", report.false_merge_quantiles),
+            ("true pairs (pairs inside predicted clusters)", report.true_pair_quantiles),
             ("missed duplicates", report.missed_quantiles),
         ],
         ".3f",
@@ -274,7 +332,10 @@ def format_error_report(report: ErrorReport) -> str:
         ],
         ".0f",
     )
-    lines += _sample_lines("Sample false merges", report.false_merge_samples)
+    lines += _sample_lines("Sample direct false edges", report.false_edge_samples)
+    lines += _sample_lines(
+        "Sample false merges (pairs inside predicted clusters)", report.false_merge_samples
+    )
     lines += _sample_lines("Sample missed duplicates", report.missed_samples)
     return "\n".join(lines)
 
@@ -335,7 +396,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         events = load_events(args.events)
         kept, _, _ = labeled_events(events)
-        vectors, embedder = read_embeddings(args.embeddings, [e.event_id for e in kept])
+        vectors, embedder = read_embeddings(
+            args.embeddings,
+            [event.event_id for event in kept],
+            [sanitize(event.text) for event in kept],
+        )
         report = analyze_errors(
             events,
             vectors,
