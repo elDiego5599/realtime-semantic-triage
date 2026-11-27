@@ -2,7 +2,8 @@
 
 A ranking is a sequence of document ids, best first. Relevance judgments are
 either a collection of relevant ids (binary gain 1) or a mapping from id to a
-graded gain. Ids with gain 0 count as not relevant. Ids must be strings and a
+graded gain. Ids with gain 0 count as not relevant; a negative, NaN or
+infinite gain raises ValueError. Ids must be strings and a
 ranking must not repeat an id (ValueError), since a repeated hit would be
 counted twice.
 """
@@ -98,7 +99,9 @@ def _ndcg(ranked: Sequence[str], gains: Mapping[str, float], k: int) -> float:
 def recall_at_k(ranked: Sequence[str], relevant: Relevance, k: int) -> float:
     """Share of relevant ids that appear in the first ``k`` results.
 
-    Raises ValueError when there is no relevant id (empty collection, or only
+    The denominator is the number of relevant ids, not min(k, number of
+    relevant ids), so recall stays below 1 when there are more relevant ids
+    than ``k``. Raises ValueError when there is no relevant id (empty collection, or only
     zero gains), because recall is undefined then.
     """
     _check_k(k)
@@ -121,7 +124,8 @@ def ndcg_at_k(ranked: Sequence[str], relevant: Relevance, k: int) -> float:
     The gain is 1 for ids in a collection and the mapped value for a mapping
     (linear gain). The result at rank r is discounted by log2(r + 1). The ideal
     DCG sorts all relevant gains in descending order and keeps the top ``k``.
-    Returns 0.0 when the ideal DCG is 0.
+    Returns 0.0 when the ideal DCG is 0. Raises ValueError for a negative,
+    NaN or infinite gain.
     """
     _check_k(k)
     _check_ranking(ranked)
@@ -134,6 +138,8 @@ def evaluate(
     ks: Sequence[int] = (1, 5, 10),
 ) -> RetrievalReport:
     """Average Recall@k, MRR and nDCG@k over queries with at least one relevant id.
+
+    ``ks`` must be non-empty and must not repeat a value (ValueError).
 
     A judged query missing from ``runs`` counts as an empty ranking (score 0).
     Queries in ``runs`` without judgments are ignored and counted as skipped;

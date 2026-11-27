@@ -28,9 +28,14 @@ def test_recall_k_larger_than_ranking():
     assert recall_at_k(["a", "b"], {"b", "z"}, 10) == pytest.approx(0.5)
 
 
-def test_recall_divides_by_relevant_count():
-    # 4 results, 2 relevant ids, 1 found
+def test_recall_misses_lower_recall():
+    # 2 relevant ids, only a is retrieved: 1 / 2
     assert recall_at_k(["a", "b", "c", "d"], {"a", "z"}, 4) == pytest.approx(0.5)
+
+
+def test_recall_denominator_is_relevant_count_not_k():
+    # k = 2 < 3 relevant ids, both results relevant: 2 / 3, not 2 / min(2, 3) = 1
+    assert recall_at_k(["a", "b"], {"a", "b", "c"}, 2) == pytest.approx(2 / 3)
 
 
 def test_recall_empty_ranking():
