@@ -16,7 +16,15 @@ from qdrant_client.models import (
 
 from semtriage.models import Event
 
-CONFIGS = ("dense", "bm25", "hybrid", "hybrid+cwe")
+CONFIGS = ("dense", "bm25", "hybrid", "hybrid+cwe", "m3-sparse", "m3-hybrid")
+M3_CONFIGS = ("m3-sparse", "m3-hybrid")
+SPARSE_FIELDS = {
+    "bm25": "bm25",
+    "hybrid": "bm25",
+    "hybrid+cwe": "bm25",
+    "m3-sparse": "m3",
+    "m3-hybrid": "m3",
+}
 
 
 def retrieve(
@@ -58,11 +66,12 @@ def retrieve(
         )
         return [point.payload["event_id"] for point in result.points]
 
+    sparse_field = SPARSE_FIELDS[config]
     sparse_indices, sparse_values = sparse_vector
     if not sparse_indices:
-        if config == "bm25":
+        if config in ("bm25", "m3-sparse"):
             return []
-        if config in ("hybrid", "hybrid+cwe"):
+        if config in ("hybrid", "hybrid+cwe", "m3-hybrid"):
             result = client.query_points(
                 collection,
                 prefetch=[
@@ -82,11 +91,11 @@ def retrieve(
 
     sparse = SparseVector(indices=sparse_indices, values=sparse_values)
 
-    if config == "bm25":
+    if config in ("bm25", "m3-sparse"):
         result = client.query_points(
             collection,
             query=sparse,
-            using="bm25",
+            using=sparse_field,
             query_filter=query_filter,
             limit=limit,
             with_payload=["event_id"],
@@ -104,7 +113,7 @@ def retrieve(
             ),
             Prefetch(
                 query=sparse,
-                using="bm25",
+                using=sparse_field,
                 filter=query_filter,
                 limit=limit,
             ),

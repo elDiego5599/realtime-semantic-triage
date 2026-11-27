@@ -135,7 +135,14 @@ def test_unknown_config_raises(
     retrieval_setup: tuple[QdrantClient, list[Event], np.ndarray],
 ) -> None:
     client, events, dense = retrieval_setup
-    assert CONFIGS == ("dense", "bm25", "hybrid", "hybrid+cwe")
+    assert CONFIGS == (
+        "dense",
+        "bm25",
+        "hybrid",
+        "hybrid+cwe",
+        "m3-sparse",
+        "m3-hybrid",
+    )
     with pytest.raises(ValueError):
         retrieve(client, events[0], dense[0], ([1], [1.0]), "unknown")
 
@@ -162,3 +169,74 @@ def test_limit_caps_results(
     client, events, dense = retrieval_setup
     hits = retrieve(client, events[0], dense[0], ([1], [1.0]), "dense", limit=1)
     assert len(hits) == 1
+
+
+def test_m3_config_without_m3_field_raises(
+    retrieval_setup: tuple[QdrantClient, list[Event], np.ndarray],
+) -> None:
+    client, events, dense = retrieval_setup
+    with pytest.raises(Exception):  # noqa: B017
+        retrieve(client, events[0], dense[0], ([1], [1.0]), "m3-sparse", limit=10)
+
+
+def test_m3_sparse_ranks_weight_overlap_first(
+    retrieval_setup: tuple[QdrantClient, list[Event], np.ndarray],
+) -> None:
+    client, events, dense = retrieval_setup
+    build_index(
+        client,
+        events,
+        dense,
+        ["gamma", "alpha", "alpha beta", "gamma"],
+        fake_sparse,
+        m3=[([1], [1.0]), ([2], [2.0]), ([1], [1.0]), ([1], [1.0])],
+    )
+
+    bm25_hits = retrieve(client, events[0], dense[0], ([1, 2], [1.0, 1.0]), "bm25", limit=10)
+    m3_hits = retrieve(
+        client,
+        events[0],
+        dense[0],
+        ([1, 2], [1.0, 2.0]),
+        "m3-sparse",
+        limit=10,
+    )
+
+    assert bm25_hits == ["nvd:sparse", "nvd:dense"]
+    assert m3_hits == ["nvd:dense", "nvd:sparse"]
+
+
+def test_empty_m3_query_sparse_empty_and_hybrid_dense(
+    retrieval_setup: tuple[QdrantClient, list[Event], np.ndarray],
+) -> None:
+    client, events, dense = retrieval_setup
+    build_index(
+        client,
+        events,
+        dense,
+        ["gamma", "beta", "alpha", "gamma"],
+        fake_sparse,
+        m3=[([], []), ([], []), ([], []), ([], [])],
+    )
+
+    dense_hits = retrieve(client, events[0], dense[0], ([], []), "dense", limit=10)
+    assert retrieve(client, events[0], dense[0], ([], []), "m3-sparse", limit=10) == []
+    assert retrieve(client, events[0], dense[0], ([], []), "m3-hybrid", limit=10) == dense_hits
+
+
+def test_m3_sparse_and_hybrid_use_m3_field(
+    retrieval_setup: tuple[QdrantClient, list[Event], np.ndarray],
+) -> None:
+    client, events, dense = retrieval_setup
+    build_index(
+        client,
+        events,
+        dense,
+        ["gamma", "beta", "alpha", "gamma"],
+        fake_sparse,
+        m3=[([1], [1.0]), ([2], [1.0]), ([1], [1.0]), ([1], [1.0])],
+    )
+    bm25 = retrieve(client, events[0], dense[0], ([1], [1.0]), "bm25", limit=10)
+    hybrid = retrieve(client, events[0], dense[0], ([2], [1.0]), "m3-hybrid", limit=10)
+    assert bm25 == ["nvd:sparse"]
+    assert hybrid == ["nvd:dense", "nvd:sparse"]

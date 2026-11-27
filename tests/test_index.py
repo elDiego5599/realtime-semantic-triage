@@ -107,3 +107,35 @@ def test_length_mismatch_raises() -> None:
         build_index(client, events, make_dense(2), ["a b", "b c", "d"], fake_sparse)
     with pytest.raises(ValueError):
         build_index(client, events, make_dense(3), ["a b", "b c"], fake_sparse)
+
+
+def test_index_with_m3_stores_both_sparse_fields() -> None:
+    client = QdrantClient(":memory:")
+    events = make_events()
+    m3 = [([1], [0.25]), ([2], [0.5]), ([1, 2], [0.3, 0.7])]
+    build_index(
+        client,
+        events,
+        make_dense(len(events)),
+        ["a b", "b c", "d"],
+        fake_sparse,
+        m3=m3,
+    )
+    vectors = client.retrieve("events", ids=[0], with_vectors=True)[0].vector
+    assert "bm25" in vectors
+    assert vectors["m3"].indices == [1]
+    assert vectors["m3"].values == [0.25]
+
+
+def test_index_rejects_m3_length_mismatch() -> None:
+    client = QdrantClient(":memory:")
+    events = make_events()
+    with pytest.raises(ValueError):
+        build_index(
+            client,
+            events,
+            make_dense(len(events)),
+            ["a b", "b c", "d"],
+            fake_sparse,
+            m3=[([1], [0.25])],
+        )

@@ -15,6 +15,7 @@ from qdrant_client.models import (
 )
 
 from semtriage.models import Event
+from semtriage.sparse_cache import Sparse
 
 SparseEncoder = Callable[[Sequence[str]], list[tuple[list[int], list[float]]]]
 
@@ -41,6 +42,7 @@ def build_index(
     sparse: SparseEncoder,
     *,
     collection: str = "events",
+    m3: Sequence[Sparse] | None = None,
 ) -> None:
     """Recreate the collection and upsert one point per event."""
     if not len(events) == dense.shape[0] == len(texts):
@@ -48,13 +50,18 @@ def build_index(
             f"length mismatch: {len(events)} events, {dense.shape[0]} dense rows, "
             f"{len(texts)} texts"
         )
+    if m3 is not None and len(m3) != len(events):
+        raise ValueError(f"length mismatch: {len(events)} events, {len(m3)} m3 sparse rows")
 
     if client.collection_exists(collection):
         client.delete_collection(collection)
+    sparse_vectors_config = {"bm25": SparseVectorParams(modifier=Modifier.IDF)}
+    if m3 is not None:
+        sparse_vectors_config["m3"] = SparseVectorParams()
     client.create_collection(
         collection_name=collection,
         vectors_config={"dense": VectorParams(size=dense.shape[1], distance=Distance.COSINE)},
-        sparse_vectors_config={"bm25": SparseVectorParams(modifier=Modifier.IDF)},
+        sparse_vectors_config=sparse_vectors_config,
     )
     client.create_payload_index(collection, "published", PayloadSchemaType.INTEGER)
     client.create_payload_index(collection, "cwe_ids", PayloadSchemaType.KEYWORD)
@@ -70,6 +77,16 @@ def build_index(
                 vector={
                     "dense": dense[row].tolist(),
                     "bm25": SparseVector(indices=indices, values=values),
+                    **(
+                        {
+                            "m3": SparseVector(
+                                indices=m3[row][0],
+                                values=m3[row][1],
+                            )
+                        }
+                        if m3 is not None
+                        else {}
+                    ),
                 },
                 payload={
                     "event_id": events[row].event_id,

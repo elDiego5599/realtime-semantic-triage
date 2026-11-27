@@ -12,6 +12,7 @@ pytest.importorskip("qdrant_client")
 from semtriage import ablation  # noqa: E402
 from semtriage.baseline import write_embeddings  # noqa: E402
 from semtriage.models import Event, Source  # noqa: E402
+from semtriage.sparse_cache import write_sparse  # noqa: E402
 from semtriage.text_mode import build_text, parse_text_mode_label  # noqa: E402
 
 
@@ -204,6 +205,143 @@ def test_run_ablation_rejects_unknown_config(monkeypatch) -> None:
     monkeypatch.setattr(ablation, "bm25_encoder", lambda: fake)
     with pytest.raises(ValueError, match="unknown"):
         ablation.run_ablation(events, dense, [event.text for event in events], fake, ("bogus",))
+
+
+def test_collect_runs_m3_config_requires_m3() -> None:
+    events, dense = fixture()
+    with pytest.raises(ValueError, match="m3"):
+        ablation.collect_runs(
+            events,
+            dense,
+            [event.text for event in events],
+            FakeSparse(),
+            ("m3-sparse",),
+        )
+
+
+def test_collect_runs_rejects_m3_wrong_length() -> None:
+    events, dense = fixture()
+    with pytest.raises(ValueError, match="length mismatch"):
+        ablation.collect_runs(
+            events,
+            dense,
+            [event.text for event in events],
+            FakeSparse(),
+            ("m3-sparse",),
+            m3=[([], []) for _ in range(len(events) - 1)],
+        )
+
+
+def test_collect_runs_m3_sparse_changes_top_hit() -> None:
+    events = [
+        make_event(Source.NVD, "CVE-1", 1, text="alpha"),
+        make_event(Source.GHSA, "CVE-1", 2, text="beta"),
+        make_event(Source.NVD, "CVE-2", 3, text="alpha"),
+        make_event(Source.GHSA, "CVE-2", 4, text="beta"),
+    ]
+    dense = np.eye(len(events), dtype=np.float32)
+
+    def sparse(texts: Sequence[str]) -> list[tuple[list[int], list[float]]]:
+        return [([1], [1.0]) if "alpha" in text else ([2], [1.0]) for text in texts]
+
+    m3 = [
+        ([1], [1.0]),
+        ([2], [1.0]),
+        ([2], [1.0]),
+        ([2], [1.0]),
+    ]
+    runs = ablation.collect_runs(
+        events,
+        dense,
+        [event.text for event in events],
+        sparse,
+        ("bm25", "m3-sparse"),
+        train_fraction=0.5,
+        m3=m3,
+    )
+    bm25_run = next(iter(runs["bm25"].values()))
+    m3_run = next(iter(runs["m3-sparse"].values()))
+
+    assert bm25_run[0] == "nvd:CVE-1"
+    assert m3_run[0] == "ghsa:CVE-1"
+
+
+def test_cli_m3_config_requires_sparse_cache(tmp_path: Path) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "m3-sparse",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_cli_rejects_stale_sparse_cache(tmp_path: Path) -> None:
+    events_path, embeddings_path, events, _ = write_mode_inputs(tmp_path, "full")
+    texts = [build_text(event, "full") for event in events]
+    sparse_path = tmp_path / "sparse.npz"
+    write_sparse(
+        sparse_path,
+        [event.event_id for event in events],
+        texts,
+        [([], []) for _ in events],
+        embedder="test",
+        text_mode="truncate:40",
+    )
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "m3-sparse",
+                "--sparse-cache",
+                str(sparse_path),
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_table_has_m3_rows_with_sparse_cache(tmp_path: Path, monkeypatch, capsys) -> None:
+    events_path, embeddings_path, events, _ = write_mode_inputs(tmp_path, "full")
+    texts = [build_text(event, "full") for event in events]
+    sparse_path = tmp_path / "sparse.npz"
+    write_sparse(
+        sparse_path,
+        [event.event_id for event in events],
+        texts,
+        [([index], [1.0]) for index in range(len(events))],
+        embedder="test",
+        text_mode="full",
+    )
+    fake = FakeSparse()
+    monkeypatch.setattr(ablation, "bm25_encoder", lambda: fake)
+    assert (
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "m3-sparse,m3-hybrid",
+                "--sparse-cache",
+                str(sparse_path),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "| m3-sparse |" in out
+    assert "| m3-hybrid |" in out
 
 
 def test_make_client_uses_server_url(monkeypatch) -> None:

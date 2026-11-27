@@ -19,10 +19,12 @@ from semtriage.index import SparseEncoder, bm25_encoder, build_index
 from semtriage.models import Event
 from semtriage.qrels import build_qrels
 from semtriage.retrieval_metrics import RetrievalReport, evaluate
-from semtriage.retrieve import CONFIGS, retrieve
+from semtriage.retrieve import CONFIGS, M3_CONFIGS, SPARSE_FIELDS, retrieve
+from semtriage.sparse_cache import Sparse, read_sparse
 from semtriage.text_mode import build_text, parse_text_mode_label
 
 SERVER_TIMEOUT = 300
+MAC_CONFIGS = tuple(config for config in CONFIGS if config not in M3_CONFIGS)
 
 
 def _validate_configs(configs: Sequence[str]) -> tuple[str, ...]:
@@ -44,9 +46,12 @@ def collect_runs(
     *,
     train_fraction: float = 0.7,
     client=None,
+    m3: Sequence[Sparse] | None = None,
 ) -> dict[str, dict[str, list[str]]]:
     """Build the local index once and collect every requested ranking."""
     requested = _validate_configs(configs)
+    if any(config in M3_CONFIGS for config in requested) and m3 is None:
+        raise ValueError("m3 retrieval configs require sparse cache vectors")
     _, test_indices = split_by_cve(events, train_fraction)
     query_indices = list(test_indices)
     queries = [events[index] for index in query_indices]
@@ -55,19 +60,26 @@ def collect_runs(
         from qdrant_client import QdrantClient
 
         client = QdrantClient(":memory:")
-    build_index(client, events, dense, texts, sparse)
+    build_index(client, events, dense, texts, sparse, m3=m3)
 
     query_texts = [texts[index] for index in query_indices]
     sparse_vectors: list[tuple[list[int], list[float]]] = []
-    for start in range(0, len(query_texts), 1024):
-        sparse_vectors.extend(sparse(query_texts[start : start + 1024]))
-    if len(sparse_vectors) != len(queries):
-        raise ValueError("sparse encoder returned a different number of vectors")
+    if any(config in SPARSE_FIELDS and SPARSE_FIELDS[config] == "bm25" for config in requested):
+        for start in range(0, len(query_texts), 1024):
+            sparse_vectors.extend(sparse(query_texts[start : start + 1024]))
+        if len(sparse_vectors) != len(queries):
+            raise ValueError("sparse encoder returned a different number of vectors")
 
     runs: dict[str, dict[str, list[str]]] = {}
     for config in requested:
         query_runs: dict[str, list[str]] = {}
-        for index, query, sparse_vector in zip(query_indices, queries, sparse_vectors, strict=True):
+        for offset, (index, query) in enumerate(zip(query_indices, queries, strict=True)):
+            if config in M3_CONFIGS:
+                sparse_vector = m3[index]
+            elif config in SPARSE_FIELDS and SPARSE_FIELDS[config] == "bm25":
+                sparse_vector = sparse_vectors[offset]
+            else:
+                sparse_vector = ([], [])
             query_runs[query.event_id] = retrieve(
                 client,
                 query,
@@ -110,10 +122,18 @@ def run_ablation(
     *,
     train_fraction: float = 0.7,
     client=None,
+    m3: Sequence[Sparse] | None = None,
 ) -> dict[str, dict[str, RetrievalReport]]:
     """Collect rankings once and evaluate each config against CVE and graded qrels."""
     runs = collect_runs(
-        events, dense, texts, sparse, configs, train_fraction=train_fraction, client=client
+        events,
+        dense,
+        texts,
+        sparse,
+        configs,
+        train_fraction=train_fraction,
+        client=client,
+        m3=m3,
     )
     _, test_indices = split_by_cve(events, train_fraction)
     return _reports_from_runs(events, runs, [events[index].event_id for index in test_indices])
@@ -186,9 +206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--configs",
-        default=",".join(CONFIGS),
+        default=",".join(MAC_CONFIGS),
         help="Comma-separated retrieval configs",
     )
+    parser.add_argument("--sparse-cache", type=Path, help="BGE-M3 sparse vector cache")
     parser.add_argument(
         "--train-fraction",
         type=float,
@@ -213,6 +234,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         configs = _validate_configs(configs)
     except ValueError as exc:
         parser.error(str(exc))
+    if any(config in M3_CONFIGS for config in configs) and args.sparse_cache is None:
+        parser.error("m3 retrieval configs require --sparse-cache")
 
     try:
         kept, _, _ = labeled_events(load_events(args.events))
@@ -221,6 +244,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ids = [event.event_id for event in kept]
         texts = [build_text(event, text_mode, max_chars=max_chars) for event in kept]
         dense, _ = read_embeddings(args.embeddings, ids, texts, text_mode=text_label)
+        m3 = (
+            read_sparse(args.sparse_cache, ids, texts, text_mode=text_label)
+            if args.sparse_cache is not None
+            else None
+        )
         _, test_indices = split_by_cve(kept, args.train_fraction)
 
         sparse = bm25_encoder()
@@ -234,6 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             configs,
             train_fraction=args.train_fraction,
             client=client,
+            m3=m3,
         )
         reports = _reports_from_runs(kept, runs, query_ids)
     except ValueError as exc:
