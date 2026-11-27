@@ -639,3 +639,41 @@ def test_main_rejects_unknown_pairs(tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         main(["--events", str(path), "--pairs", "same-source"])
     assert excinfo.value.code == 2
+
+
+def test_cross_source_joins_pair_at_exact_threshold():
+    # 1 * 0.5 + 0 * sqrt(0.75) is exactly 0.5 in binary floating point.
+    vectors = np.array([[1.0, 0.0], [0.5, np.sqrt(0.75)]])
+    assert threshold_clusters(vectors, 0.5, groups=["nvd", "ghsa"]) == [0, 0]
+
+
+def test_format_report_numeric_precision_when_pairs_predicted_with_zero_recall():
+    report = BaselineReport(
+        embedder="e",
+        n_events=3,
+        n_excluded=0,
+        rows=[
+            SweepRow(
+                threshold=0.5,
+                n_clusters=2,
+                pairwise=Scores(precision=0.0, recall=0.0, f1=0.0),
+                bcubed=Scores(precision=1.0, recall=1.0, f1=1.0),
+            )
+        ],
+    )
+    lines = format_report(report).splitlines()
+    assert "| 0.50 | 2 | 0.000 | 0.000 | 0.000 | 1.000 | 1.000 | 1.000 |" in lines
+
+
+def test_edge_indices_are_int32():
+    from semtriage.baseline import _collect_cross_edges, _collect_edges
+
+    vectors = np.array([A, A, C])
+    for _, lefts, rights in (
+        _collect_edges(vectors, -1.0),
+        _collect_cross_edges(vectors, ["nvd", "ghsa", "nvd"], -1.0),
+        _collect_edges(vectors, 2.0),
+        _collect_cross_edges(vectors, ["nvd", "nvd", "nvd"], -1.0),
+    ):
+        assert lefts.dtype == np.int32
+        assert rights.dtype == np.int32

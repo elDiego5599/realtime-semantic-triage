@@ -97,8 +97,8 @@ def _sorted_edges(
     if not similarity_parts:
         return (
             np.empty(0, dtype=np.float64),
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
         )
     similarities = np.concatenate(similarity_parts)
     lefts = np.concatenate(left_parts)
@@ -118,8 +118,8 @@ def _collect_edges(matrix: np.ndarray, minimum_threshold: float) -> _Edges:
         keep = local_rows < local_cols
         if np.any(keep):
             similarity_parts.append(block[local_rows[keep], local_cols[keep]])
-            left_parts.append(local_rows[keep] + start)
-            right_parts.append(local_cols[keep] + start)
+            left_parts.append((local_rows[keep] + start).astype(np.int32))
+            right_parts.append((local_cols[keep] + start).astype(np.int32))
     return _sorted_edges(similarity_parts, left_parts, right_parts)
 
 
@@ -132,12 +132,15 @@ def _collect_cross_edges(
 
     Only cross-group dot products are computed. The larger group of each pair is
     walked in row blocks against all rows of the smaller one, so a block holds at
-    most 1024 rows times the smaller group's size.
+    most 1024 rows times the smaller group's size. That bound is for the block
+    only: the returned edge list grows with the number of edges at or above
+    `minimum_threshold`. Indices are int32 and similarities stay float64, so no
+    edge moves across a threshold.
     """
     rows_by_group: dict[Hashable, list[int]] = {}
     for row, group in enumerate(groups):
         rows_by_group.setdefault(group, []).append(row)
-    group_rows = [np.asarray(rows, dtype=np.int64) for rows in rows_by_group.values()]
+    group_rows = [np.asarray(rows, dtype=np.int32) for rows in rows_by_group.values()]
 
     similarity_parts: list[np.ndarray] = []
     left_parts: list[np.ndarray] = []
