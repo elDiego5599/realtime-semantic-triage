@@ -14,7 +14,7 @@ _GHSA_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(
-    r"""https?://(?:[^\s<>"'()]|\([^\s<>"'()]*\))*""",
+    r"""https?://(?:[^\s<>"'()`]|\([^\s<>"'()`]*\))*""",
     re.IGNORECASE,
 )
 _MARKDOWN_LINK_RE = re.compile(rf"\[([^\[\]]*)\]\({_SENTINEL}\)")
@@ -22,10 +22,42 @@ _EMPTY_PAIR_RES = (
     re.compile(rf"\([\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*\)"),
     re.compile(rf"\[[\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*\]"),
     re.compile(rf"<[\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*>"),
+    re.compile(rf"(?<![^\s{_SENTINEL}(\[<])`{_SENTINEL}+`(?![^\s{_SENTINEL})\]>.,;:!?])"),
     re.compile(
         rf"(?<![^\s{_SENTINEL}(\[<])\*\*"
         rf"[\s,;:{_SENTINEL}]*{_SENTINEL}[\s,;:{_SENTINEL}]*"
         rf"\*\*(?![^\s{_SENTINEL})\]>.,;:!?])"
+    ),
+)
+_LABEL = (
+    r"(?:(?:fix|patch|upstream|github|gitlab|nvd|security|original) )?"
+    r"(?:fix|patch|commit|url|link|references?|origin|repository|repo|advisory"
+    r"|cve|cve ids?|ghsa|ghsa id|pr|pull request|issue|report|source|patchwork)"
+)
+# Residue that only exists because a removed identifier or URL left it behind.
+# Every pattern requires a sentinel, so text without removals is never touched.
+_RESIDUE_RES = (
+    # "A, B and C" or "A / B" where every item was removed.
+    re.compile(
+        rf"{_SENTINEL}(?:[ \t]*(?:[,/|&;]|(?<![A-Za-z])(?:and|or)(?![A-Za-z])))+[ \t]*{_SENTINEL}",
+        re.IGNORECASE,
+    ),
+    # Template sentence whose only content was the identifier.
+    re.compile(
+        rf"\bThis (?:vulnerability|issue|advisory) corresponds to[ \t]*{_SENTINEL}+[ \t]*(?:\.|$)",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # A label line such as "CVE ID: <id>" or "- Fix commit: <url>" left without a value.
+    re.compile(
+        rf"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?{_LABEL}(?:\*\*)?:(?:\*\*)?[ \t]*"
+        rf"{_SENTINEL}[{_SENTINEL} \t.,;]*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # A list item or line left with only markers and punctuation.
+    re.compile(
+        rf"^(?=[^\n]*{_SENTINEL})(?:[ \t]*(?:[-*+>]|#+|\d+\.|\[\d+\]))?"
+        rf"[{_SENTINEL} \t`'\".,;:/|\\-]*$",
+        re.MULTILINE,
     ),
 )
 _UNICODE_DASH_RE = re.compile(r"[\u2010-\u2015]")
@@ -53,10 +85,10 @@ def _replace_url(match: re.Match[str]) -> str:
 
 
 def _clean_empty_markup(text: str) -> str:
-    """Remove bracket pairs that a removal left empty, innermost first."""
+    """Remove bracket pairs and other residue that a removal left empty, innermost first."""
     while True:
         updated = text
-        for pattern in _EMPTY_PAIR_RES:
+        for pattern in (*_EMPTY_PAIR_RES, *_RESIDUE_RES):
             updated = pattern.sub(_SENTINEL, updated)
         if updated == text:
             return text
@@ -69,7 +101,7 @@ def _canonical_identifier(identifier: str) -> str:
 
 def sanitize(text: str) -> str:
     """Remove identifiers and URLs, and normalize advisory text whitespace."""
-    result = text
+    result = text.replace("\r\n", "\n")
     while True:
         updated = _URL_RE.sub(_replace_url, result)
         updated = _CVE_RE.sub(_SENTINEL, updated)
