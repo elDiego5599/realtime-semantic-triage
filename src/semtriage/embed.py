@@ -101,3 +101,20 @@ class BgeM3Embedder:
                 f"expected dense vectors of shape ({len(texts)}, {self.dim}), got {dense.shape}"
             )
         return l2_normalize(dense)
+
+    def embed_sparse(self, texts: Sequence[str]):
+        """Embed texts into sorted sparse lexical-weight vectors."""
+        from semtriage.sparse_cache import lexical_weights_to_sparse
+
+        _check_texts(texts)
+        if len(texts) == 0:
+            return []
+        encoded = self._model.encode(
+            list(texts),
+            batch_size=self.batch_size,
+            max_length=self.max_length,
+            return_dense=False,
+            return_sparse=True,
+            return_colbert_vecs=False,
+        )
+        return [lexical_weights_to_sparse(weights) for weights in encoded["lexical_weights"]]
