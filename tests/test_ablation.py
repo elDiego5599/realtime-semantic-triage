@@ -204,3 +204,31 @@ def test_run_ablation_rejects_unknown_config(monkeypatch) -> None:
     monkeypatch.setattr(ablation, "bm25_encoder", lambda: fake)
     with pytest.raises(ValueError, match="unknown"):
         ablation.run_ablation(events, dense, [event.text for event in events], fake, ("bogus",))
+
+
+def test_make_client_uses_server_url(monkeypatch) -> None:
+    import qdrant_client
+
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            seen.update(kwargs)
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", FakeClient)
+    ablation.make_client(url="http://127.0.0.1:6333")
+    assert seen["url"] == "http://127.0.0.1:6333"
+    assert seen["timeout"] >= 60
+
+
+def test_make_client_defaults_to_memory() -> None:
+    assert ablation.make_client() is None
+
+
+def test_cli_rejects_index_path_with_url(tmp_path: Path) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    argv = ["--events", events_path, "--embeddings", embeddings_path]
+    argv += ["--index-path", str(tmp_path / "idx"), "--qdrant-url", "http://127.0.0.1:6333"]
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(argv)
+    assert exc.value.code == 2

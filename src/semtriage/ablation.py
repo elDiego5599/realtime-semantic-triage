@@ -22,6 +22,8 @@ from semtriage.retrieval_metrics import RetrievalReport, evaluate
 from semtriage.retrieve import CONFIGS, retrieve
 from semtriage.text_mode import build_text, parse_text_mode_label
 
+SERVER_TIMEOUT = 300
+
 
 def _validate_configs(configs: Sequence[str]) -> tuple[str, ...]:
     requested = tuple(configs)
@@ -132,6 +134,17 @@ def _reports_from_runs(
     return result
 
 
+def make_client(index_path: Path | None = None, url: str | None = None):
+    """Return a Qdrant client for a server URL or a local path, or None for in-memory."""
+    if index_path is None and url is None:
+        return None
+    from qdrant_client import QdrantClient
+
+    if url is not None:
+        return QdrantClient(url=url, timeout=SERVER_TIMEOUT)
+    return QdrantClient(path=str(index_path))
+
+
 def format_ablation(
     reports: dict[str, dict[str, RetrievalReport]],
     *,
@@ -183,7 +196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Share of CVEs, oldest first, in the train split (default 0.7)",
     )
     parser.add_argument("--save-runs", type=Path, help="Write retrieved ids as JSON")
-    parser.add_argument("--index-path", type=Path, help="Persist the local Qdrant index")
+    location = parser.add_mutually_exclusive_group()
+    location.add_argument("--index-path", type=Path, help="Persist the local Qdrant index")
+    location.add_argument(
+        "--qdrant-url", help="Use a Qdrant server, e.g. http://127.0.0.1:6333 (recreates 'events')"
+    )
     args = parser.parse_args(argv)
 
     if not args.events.is_file():
@@ -207,12 +224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _, test_indices = split_by_cve(kept, args.train_fraction)
 
         sparse = bm25_encoder()
-        if args.index_path is not None:
-            from qdrant_client import QdrantClient
-
-            client = QdrantClient(path=str(args.index_path))
-        else:
-            client = None
+        client = make_client(args.index_path, args.qdrant_url)
         query_ids = [kept[index].event_id for index in test_indices]
         runs = collect_runs(
             kept,
@@ -236,6 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "collect_runs",
     "format_ablation",
+    "make_client",
     "main",
     "run_ablation",
 ]
