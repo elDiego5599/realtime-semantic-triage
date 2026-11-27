@@ -465,7 +465,7 @@ def test_cli_full_cache_prints_no_text_line(tmp_path, capsys) -> None:
     assert "Text:" not in capsys.readouterr().out
 
 
-def test_cli_rejects_cache_whose_texts_do_not_match_its_label(tmp_path) -> None:
+def test_cli_rejects_cache_whose_texts_do_not_match_its_label(tmp_path, capsys) -> None:
     events_path, embeddings_path = write_mode_inputs(tmp_path, "lead:20")
     events, vectors = fixture()
     long_text = "First line of the advisory text.\n" + "word " * 60
@@ -482,3 +482,33 @@ def test_cli_rejects_cache_whose_texts_do_not_match_its_label(tmp_path) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--events", events_path, "--embeddings", embeddings_path])
     assert exc.value.code == 2
+    assert "texts differ" in capsys.readouterr().err
+
+
+def rewrite_label(path: str, label: str | None) -> None:
+    """Replace the cache's text mode label, or drop it to mimic an older unlabeled cache."""
+    data = dict(np.load(path, allow_pickle=False))
+    if label is None:
+        data.pop("text_mode", None)
+    else:
+        data["text_mode"] = np.asarray(label, dtype=str)
+    with open(path, "wb") as target:
+        np.savez(target, **data)
+
+
+def test_cli_treats_unlabeled_cache_as_full(tmp_path, capsys) -> None:
+    events, vectors = fixture()
+    events_path, embeddings_path = write_inputs(tmp_path, events, vectors)
+    rewrite_label(embeddings_path, None)
+    assert main(["--events", events_path, "--embeddings", embeddings_path]) == 0
+    assert "Text:" not in capsys.readouterr().out
+
+
+def test_cli_rejects_bad_text_mode_label(tmp_path, capsys) -> None:
+    events, vectors = fixture()
+    events_path, embeddings_path = write_inputs(tmp_path, events, vectors)
+    rewrite_label(embeddings_path, "bogus:5")
+    with pytest.raises(SystemExit) as exc:
+        main(["--events", events_path, "--embeddings", embeddings_path])
+    assert exc.value.code == 2
+    assert "bad text mode label" in capsys.readouterr().err
