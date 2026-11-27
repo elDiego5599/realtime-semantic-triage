@@ -1,5 +1,6 @@
 """Normalizers that turn raw NVD and GHSA records into Events."""
 
+import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import get_args
@@ -27,6 +28,36 @@ def _parse_utc(value: str) -> datetime:
 
 def _sorted_unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(set(values)))
+
+
+def product_key_from_package(name: str) -> str:
+    """Return the lowercased package name without its namespace."""
+    return re.split(r"[/:]", name)[-1].lower()
+
+
+def _cpe_product(criteria: str) -> str | None:
+    parts = re.split(r"(?<!\\):", criteria)
+    if len(parts) < 5:
+        return None
+    product = parts[4].replace("\\", "").lower()
+    return None if product in {"", "*"} else product
+
+
+def _cpe_products(nodes: list[dict]) -> Iterable[str]:
+    for node in nodes:
+        for match in node.get("cpeMatch") or []:
+            product = _cpe_product(match.get("criteria") or "")
+            if product is not None:
+                yield product
+        yield from _cpe_products(node.get("children") or [])
+
+
+def product_keys_from_cpes(configurations: list[dict]) -> tuple[str, ...]:
+    """Return sorted, unique, lowercased product keys from CPE configurations."""
+    products = []
+    for configuration in configurations or []:
+        products.extend(_cpe_products(configuration.get("nodes") or []))
+    return _sorted_unique(products)
 
 
 def _first_english_description(descriptions: list[dict]) -> str:
@@ -93,6 +124,7 @@ def normalize_nvd(item: dict) -> Event | None:
         cwe_ids=_nvd_cwe_ids(cve.get("weaknesses") or []),
         ecosystems=(),
         packages=(),
+        products=product_keys_from_cpes(cve.get("configurations") or []),
         cna=cve.get("sourceIdentifier"),
         severity=_nvd_severity(cve.get("metrics") or {}),
     )
@@ -138,6 +170,7 @@ def normalize_ghsa(advisory: dict) -> Event | None:
         cwe_ids=_sorted_unique(cwe["cwe_id"] for cwe in advisory.get("cwes") or []),
         ecosystems=_sorted_unique(ecosystems),
         packages=_sorted_unique(packages),
+        products=_sorted_unique(product_key_from_package(name) for name in packages),
         cna=None,
         severity=_ghsa_severity(advisory.get("severity")),
     )

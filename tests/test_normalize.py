@@ -7,7 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from semtriage.models import Event, Source
-from semtriage.normalize import normalize_ghsa, normalize_nvd
+from semtriage.normalize import (
+    normalize_ghsa,
+    normalize_nvd,
+    product_key_from_package,
+    product_keys_from_cpes,
+)
 from semtriage.sanitize import find_identifiers
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -176,6 +181,73 @@ def test_ghsa_missing_optional_keys(ghsa_item):
 def test_ghsa_withdrawn_is_skipped(ghsa_item):
     ghsa_item["withdrawn_at"] = "2026-11-26T00:00:00Z"
     assert normalize_ghsa(ghsa_item) is None
+
+
+# Products
+
+
+def test_package_key_takes_last_segment():
+    assert product_key_from_package("org.apache.logging.log4j:log4j-core") == "log4j-core"
+    assert product_key_from_package("@babel/Core") == "core"
+    assert product_key_from_package("lodash") == "lodash"
+
+
+def test_cpe_product_unescaped():
+    conf = [
+        {
+            "nodes": [
+                {
+                    "cpeMatch": [
+                        {"criteria": "cpe:2.3:a:rrwo:data\\:\\:entropy:*:*:*:*:*:perl:*:*"},
+                        {"criteria": "cpe:2.3:a:Apache:Log4j:2.0:*:*:*:*:*:*:*"},
+                        {"criteria": "cpe:2.3:a:apache:log4j:2.1:*:*:*:*:*:*:*"},
+                    ]
+                }
+            ]
+        }
+    ]
+    assert product_keys_from_cpes(conf) == ("data::entropy", "log4j")
+
+
+def test_nvd_products_from_cpe_configurations(nvd_item):
+    nvd_item["cve"]["configurations"] = [
+        {"nodes": [{"cpeMatch": [{"criteria": "cpe:2.3:a:waline:waline:*:*:*:*:*:node.js:*:*"}]}]}
+    ]
+    assert normalize_nvd(nvd_item).products == ("waline",)
+
+
+def test_nvd_products_from_nested_children(nvd_item):
+    nvd_item["cve"]["configurations"] = [
+        {
+            "nodes": [
+                {
+                    "cpeMatch": [{"criteria": "cpe:2.3:a:waline:client:1.0:*:*:*:*:node.js:*:*"}],
+                    "children": [
+                        {"cpeMatch": [{"criteria": "cpe:2.3:a:acme:Server:2.0:*:*:*:*:*:*:*"}]}
+                    ],
+                }
+            ]
+        }
+    ]
+    assert normalize_nvd(nvd_item).products == ("client", "server")
+
+
+def test_nvd_products_without_configurations(nvd_item):
+    assert normalize_nvd(nvd_item).products == ()
+    nvd_item["cve"]["configurations"] = []
+    assert normalize_nvd(nvd_item).products == ()
+
+
+def test_ghsa_products_from_packages(ghsa_item):
+    assert normalize_ghsa(ghsa_item).products == ("client",)
+
+
+def test_ghsa_products_sorted_unique(ghsa_item):
+    vuln = ghsa_item["vulnerabilities"][0]
+    extra = copy.deepcopy(vuln)
+    extra["package"] = {"ecosystem": "pip", "name": "Waline-Py"}
+    ghsa_item["vulnerabilities"] += [copy.deepcopy(vuln), extra]
+    assert normalize_ghsa(ghsa_item).products == ("client", "waline-py")
 
 
 # Shared

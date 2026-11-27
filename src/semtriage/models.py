@@ -30,5 +30,6 @@ class Event(BaseModel):
     cwe_ids: tuple[str, ...]
     ecosystems: tuple[str, ...]
     packages: tuple[str, ...]
+    products: tuple[str, ...] = ()
     cna: str | None
     severity: Severity | None
