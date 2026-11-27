@@ -1,3 +1,4 @@
+import argparse
 import sys
 import types
 from collections.abc import Sequence
@@ -6,6 +7,7 @@ from datetime import UTC, datetime
 import numpy as np
 import pytest
 
+from semtriage import holdout as holdout_module
 from semtriage.baseline import (
     DEFAULT_THRESHOLDS,
     PAIR_MODES,
@@ -20,6 +22,8 @@ from semtriage.baseline import (
     main,
     mutual_best_clusters,
     mutual_best_pairs,
+    parse_thresholds,
+    precision_cell,
     run_baseline,
     singletons_reference,
     sweep,
@@ -930,26 +934,17 @@ def test_main_rule_errors_are_usage_errors(tmp_path, extra):
 
 
 def test_parse_thresholds_is_shared_with_holdout() -> None:
-    from semtriage import baseline, holdout
-
-    assert holdout.parse_thresholds is baseline.parse_thresholds
-    assert baseline.parse_thresholds(" 0.7, 0.8 ,") == (0.7, 0.8)
+    assert holdout_module.parse_thresholds is parse_thresholds
+    assert parse_thresholds(" 0.7, 0.8 ,") == (0.7, 0.8)
 
 
 @pytest.mark.parametrize("value", ["", " , ", "a,b", "0.7,nan", "inf"])
 def test_parse_thresholds_rejects_bad_values(value) -> None:
-    import argparse
-
-    from semtriage.baseline import parse_thresholds
-
     with pytest.raises(argparse.ArgumentTypeError):
         parse_thresholds(value)
 
 
 def test_precision_cell_is_na_without_predicted_pairs() -> None:
-    from semtriage.baseline import precision_cell
-    from semtriage.metrics import Scores
-
     scores = Scores(precision=0.25, recall=0.5, f1=1 / 3)
     assert precision_cell(scores, n_clusters=4, n_events=4) == "n/a"
     assert precision_cell(scores, n_clusters=3, n_events=4) == "0.250"
