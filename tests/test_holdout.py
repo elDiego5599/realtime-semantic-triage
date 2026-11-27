@@ -16,6 +16,7 @@ from semtriage.holdout import (
 from semtriage.metrics import Scores
 from semtriage.models import Event, Source
 from semtriage.sanitize import sanitize
+from semtriage.text_mode import build_text, parse_text_mode_label
 
 
 def make_event(
@@ -425,3 +426,89 @@ def test_cli_rejects_malformed_thresholds(tmp_path) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--events", events_path, "--embeddings", embeddings_path, "--thresholds", "a,b"])
     assert exc.value.code == 2
+
+
+def write_mode_inputs(tmp_path, label: str) -> tuple[str, str]:
+    """Write events with long texts and a cache embedded with the text mode in `label`."""
+    events, vectors = fixture()
+    long_text = "First line of the advisory text.\n" + "word " * 60
+    events = [event.model_copy(update={"text": long_text}) for event in events]
+    mode, max_chars = parse_text_mode_label(label)
+    texts = [build_text(event, mode, max_chars=max_chars) for event in events]
+    assert texts != [sanitize(event.text) for event in events]
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text("".join(event.model_dump_json() + "\n" for event in events))
+    embeddings_path = tmp_path / "vectors.npz"
+    ids = [event.event_id for event in events]
+    write_embeddings(
+        embeddings_path, ids, texts, vectors, embedder="test-embedder", text_mode=label
+    )
+    return str(events_path), str(embeddings_path)
+
+
+@pytest.mark.parametrize("label", ["lead:20", "truncate:40"])
+def test_cli_uses_text_mode_stored_in_cache(tmp_path, capsys, label) -> None:
+    events_path, embeddings_path = write_mode_inputs(tmp_path, label)
+    thresholds = ",".join(str(threshold) for threshold in THRESHOLDS)
+    argv = ["--events", events_path, "--embeddings", embeddings_path, "--thresholds", thresholds]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    mode, max_chars = parse_text_mode_label(label)
+    assert f"Text: {mode} (max {max_chars} chars)" in out
+    assert "| mutual-best | tune | 0.73 |" in out
+
+
+def test_cli_full_cache_prints_no_text_line(tmp_path, capsys) -> None:
+    events, vectors = fixture()
+    events_path, embeddings_path = write_inputs(tmp_path, events, vectors)
+    assert main(["--events", events_path, "--embeddings", embeddings_path]) == 0
+    assert "Text:" not in capsys.readouterr().out
+
+
+def test_cli_rejects_cache_whose_texts_do_not_match_its_label(tmp_path, capsys) -> None:
+    events_path, embeddings_path = write_mode_inputs(tmp_path, "lead:20")
+    events, vectors = fixture()
+    long_text = "First line of the advisory text.\n" + "word " * 60
+    events = [event.model_copy(update={"text": long_text}) for event in events]
+    wrong = [build_text(event, "lead", max_chars=30) for event in events]
+    write_embeddings(
+        embeddings_path,
+        [event.event_id for event in events],
+        wrong,
+        vectors,
+        embedder="test-embedder",
+        text_mode="lead:20",
+    )
+    with pytest.raises(SystemExit) as exc:
+        main(["--events", events_path, "--embeddings", embeddings_path])
+    assert exc.value.code == 2
+    assert "texts differ" in capsys.readouterr().err
+
+
+def rewrite_label(path: str, label: str | None) -> None:
+    """Replace the cache's text mode label, or drop it to mimic an older unlabeled cache."""
+    data = dict(np.load(path, allow_pickle=False))
+    if label is None:
+        data.pop("text_mode", None)
+    else:
+        data["text_mode"] = np.asarray(label, dtype=str)
+    with open(path, "wb") as target:
+        np.savez(target, **data)
+
+
+def test_cli_treats_unlabeled_cache_as_full(tmp_path, capsys) -> None:
+    events, vectors = fixture()
+    events_path, embeddings_path = write_inputs(tmp_path, events, vectors)
+    rewrite_label(embeddings_path, None)
+    assert main(["--events", events_path, "--embeddings", embeddings_path]) == 0
+    assert "Text:" not in capsys.readouterr().out
+
+
+def test_cli_rejects_bad_text_mode_label(tmp_path, capsys) -> None:
+    events, vectors = fixture()
+    events_path, embeddings_path = write_inputs(tmp_path, events, vectors)
+    rewrite_label(embeddings_path, "bogus:5")
+    with pytest.raises(SystemExit) as exc:
+        main(["--events", events_path, "--embeddings", embeddings_path])
+    assert exc.value.code == 2
+    assert "bad text mode label" in capsys.readouterr().err
