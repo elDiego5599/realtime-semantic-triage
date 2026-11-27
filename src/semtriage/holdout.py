@@ -7,7 +7,12 @@ on the tune split (ties: lowest threshold) is then scored on the test split, nex
 the test split's own best (oracle) threshold. Clustering runs within each split only.
 
 The cut is by CVE, not by date: a tune CVE may have a later advisory published after
-the first test CVE.
+the first test CVE, and CVEs that share the boundary date can land on both sides.
+
+Each split is clustered and scored against its own events only, so a smaller split
+has fewer wrong candidates per event and its precision is not directly comparable
+with a larger one. The report therefore adds a size-matched tune row: the latest tune
+CVEs, as many as the test split has, scored at the chosen threshold.
 """
 
 import argparse
@@ -45,16 +50,7 @@ def split_by_cve(events: Sequence[Event], train_fraction: float) -> tuple[list[i
     """
     if not 0.0 < train_fraction < 1.0:
         raise ValueError(f"train fraction must be between 0 and 1, got {train_fraction}")
-    earliest: dict[str, datetime] = {}
-    labels: list[str] = []
-    for event in events:
-        label = gold_label(event)
-        if label is None:
-            raise ValueError(f"event {event.event_id} does not have exactly one CVE id")
-        labels.append(label)
-        if label not in earliest or event.published < earliest[label]:
-            earliest[label] = event.published
-    ordered = sorted(earliest, key=lambda cve: (earliest[cve], cve))
+    labels, ordered, _ = _order_cves(events)
     n_tune = math.floor(train_fraction * len(ordered) + 0.5)
     if n_tune == 0 or n_tune == len(ordered):
         raise ValueError(
@@ -66,6 +62,20 @@ def split_by_cve(events: Sequence[Event], train_fraction: float) -> tuple[list[i
     return tune, test
 
 
+def _order_cves(events: Sequence[Event]) -> tuple[list[str], list[str], dict[str, datetime]]:
+    """Return each event's CVE, the CVEs oldest first and each CVE's earliest date."""
+    earliest: dict[str, datetime] = {}
+    labels: list[str] = []
+    for event in events:
+        label = gold_label(event)
+        if label is None:
+            raise ValueError(f"event {event.event_id} does not have exactly one CVE id")
+        labels.append(label)
+        if label not in earliest or event.published < earliest[label]:
+            earliest[label] = event.published
+    return labels, sorted(earliest, key=lambda cve: (earliest[cve], cve)), earliest
+
+
 def pick_threshold(rows: Sequence[SweepRow]) -> SweepRow:
     """Return the row with the best pairwise F1; ties go to the lowest threshold."""
     if not rows:
@@ -75,10 +85,14 @@ def pick_threshold(rows: Sequence[SweepRow]) -> SweepRow:
 
 @dataclass(frozen=True, slots=True)
 class RuleResult:
-    """One rule's tune pick, its test score and the test split's own best."""
+    """One rule's tune pick, its test score and the test split's own best.
+
+    `tune_matched` scores the chosen threshold on the size-matched tune subset.
+    """
 
     rule: str
     tune: SweepRow
+    tune_matched: SweepRow
     test: SweepRow
     oracle: SweepRow
 
@@ -92,6 +106,9 @@ class HoldoutReport:
     n_test_events: int
     n_tune_cves: int
     n_test_cves: int
+    n_matched_events: int
+    n_matched_cves: int
+    tune_end: datetime
     test_start: datetime
     results: list[RuleResult]
 
@@ -133,23 +150,37 @@ def evaluate_holdout(
     if matrix.ndim != 2 or len(matrix) != len(events):
         raise ValueError(f"vectors must be 2-D with {len(events)} rows, got shape {matrix.shape}")
     tune, test = split_by_cve(events, train_fraction)
+    labels, ordered, earliest = _order_cves(events)
+    n_tune_cves = len({labels[index] for index in tune})
+    n_test_cves = len(ordered) - n_tune_cves
+    matched_cves = set(ordered[max(0, n_tune_cves - n_test_cves) : n_tune_cves])
+    matched = [index for index in tune if labels[index] in matched_cves]
     results: list[RuleResult] = []
     for rule in rules:
         tune_rows = _split_sweep(events, matrix, tune, thresholds, rule)
         test_rows = _split_sweep(events, matrix, test, thresholds, rule)
         picked = pick_threshold(tune_rows)
         test_row = next(row for row in test_rows if row.threshold == picked.threshold)
+        (matched_row,) = _split_sweep(events, matrix, matched, [picked.threshold], rule)
         results.append(
-            RuleResult(rule=rule, tune=picked, test=test_row, oracle=pick_threshold(test_rows))
+            RuleResult(
+                rule=rule,
+                tune=picked,
+                tune_matched=matched_row,
+                test=test_row,
+                oracle=pick_threshold(test_rows),
+            )
         )
-    test_cves = {gold_label(events[index]) for index in test}
     return HoldoutReport(
         train_fraction=train_fraction,
         n_tune_events=len(tune),
         n_test_events=len(test),
-        n_tune_cves=len({gold_label(events[index]) for index in tune}),
-        n_test_cves=len(test_cves),
-        test_start=min(event.published for event in events if gold_label(event) in test_cves),
+        n_tune_cves=n_tune_cves,
+        n_test_cves=n_test_cves,
+        n_matched_events=len(matched),
+        n_matched_cves=len(matched_cves),
+        tune_end=earliest[ordered[n_tune_cves - 1]],
+        test_start=earliest[ordered[n_tune_cves]],
         results=results,
     )
 
@@ -170,15 +201,33 @@ def format_holdout(report: HoldoutReport, *, embedder: str, n_excluded: int = 0)
         f"Events: {report.n_tune_events + report.n_test_events} (excluded: {n_excluded})",
         "Pairs: cross-source",
         f"Train fraction: {report.train_fraction}",
-        f"Tune: {report.n_tune_events} events, {report.n_tune_cves} CVEs",
+        f"Tune: {report.n_tune_events} events, {report.n_tune_cves} CVEs "
+        f"(last CVE published {report.tune_end.isoformat()})",
         f"Test: {report.n_test_events} events, {report.n_test_cves} CVEs "
         f"(first CVE published {report.test_start.isoformat()})",
+        f"Size-matched tune: {report.n_matched_events} events, {report.n_matched_cves} CVEs "
+        "(latest tune CVEs)",
+        "CVE dates are each CVE's earliest advisory.",
+    ]
+    if report.tune_end == report.test_start:
+        lines.append("Note: tune and test CVEs share the boundary date.")
+    lines += [
+        "Note: each split is clustered and scored against its own events only; a smaller "
+        "pool has fewer wrong candidates, so compare test with the size-matched tune row.",
         "",
         "| rule | split | threshold | clusters | pairwise P | pairwise R | pairwise F1 | B3 F1 |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for result in report.results:
         lines.append(_result_row(result.rule, "tune", result.tune, report.n_tune_events))
+        lines.append(
+            _result_row(
+                result.rule,
+                "tune (size-matched)",
+                result.tune_matched,
+                report.n_matched_events,
+            )
+        )
         lines.append(_result_row(result.rule, "test", result.test, report.n_test_events))
         lines.append(_result_row(result.rule, "test oracle", result.oracle, report.n_test_events))
     return "\n".join(lines)

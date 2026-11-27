@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 import numpy as np
 import pytest
 
-from semtriage.baseline import RULES, SweepRow, write_embeddings
+from semtriage.baseline import RULES, SweepRow, sweep, write_embeddings
 from semtriage.holdout import (
     DEFAULT_THRESHOLDS,
     evaluate_holdout,
@@ -166,6 +166,22 @@ def test_pick_threshold_ties_go_to_lowest_threshold() -> None:
     assert pick_threshold(rows).threshold == 0.75
 
 
+def test_pick_threshold_ranks_by_pairwise_f1_not_bcubed() -> None:
+    pairwise_best = SweepRow(
+        threshold=0.8,
+        n_clusters=1,
+        pairwise=Scores(precision=0.9, recall=0.9, f1=0.9),
+        bcubed=Scores(precision=0.5, recall=0.5, f1=0.5),
+    )
+    bcubed_best = SweepRow(
+        threshold=0.7,
+        n_clusters=1,
+        pairwise=Scores(precision=0.4, recall=0.4, f1=0.4),
+        bcubed=Scores(precision=0.99, recall=0.99, f1=0.99),
+    )
+    assert pick_threshold([bcubed_best, pairwise_best]) is pairwise_best
+
+
 def test_pick_threshold_rejects_no_rows() -> None:
     with pytest.raises(ValueError):
         pick_threshold([])
@@ -281,6 +297,60 @@ def test_format_holdout_prints_a_markdown_table() -> None:
     assert "| single-link | test | 0.73 |" in text
     assert "| single-link | test oracle | 0.60 |" in text
     assert "| mutual-best | tune | 0.73 |" in text
+    assert "| single-link | tune (size-matched) | 0.73 |" in text
+    assert "Tune: 6 events, 4 CVEs (last CVE published 2024-01-05T00:00:00+00:00)" in text
+    assert "Test: 3 events, 2 CVEs (first CVE published 2024-02-01T00:00:00+00:00)" in text
+    assert "Size-matched tune: 2 events, 2 CVEs (latest tune CVEs)" in text
+    assert "own events only" in text
+    assert "share the boundary date" not in text
+
+
+def test_format_holdout_notes_a_shared_boundary_date() -> None:
+    events = [
+        make_event(Source.NVD, "CVE-A", 1),
+        make_event(Source.GHSA, "CVE-A", 2),
+        make_event(Source.NVD, "CVE-B", 1, text="other"),
+        make_event(Source.GHSA, "CVE-B", 3),
+    ]
+    vectors = pair_vectors([0.9, 0.9], singles=0)
+    report = evaluate_holdout(events, vectors, (0.5,), train_fraction=0.5)
+    assert report.tune_end == report.test_start
+    assert "share the boundary date" in format_holdout(report, embedder="e")
+
+
+@pytest.mark.parametrize("rule", RULES)
+def test_size_matched_tune_row_scores_the_latest_tune_cves(rule: str) -> None:
+    events, vectors = fixture()
+    report = evaluate_holdout(events, vectors, THRESHOLDS, train_fraction=0.7, rules=(rule,))
+    result = report.results[0]
+    # Two test CVEs, so the two latest tune CVEs: CVE-3 and CVE-4 (rows 4 and 5),
+    # whose cross-source pair at 0.72 stays apart at the chosen 0.73.
+    assert report.n_matched_cves == 2
+    assert report.n_matched_events == 2
+    subset = events[4:6]
+    expected = sweep(
+        [event.event_id for event in subset],
+        vectors[4:6],
+        {event.event_id: event.cve_ids[0] for event in subset},
+        [0.73],
+        groups=[event.source for event in subset],
+        rule=rule,
+    )[0]
+    assert result.tune_matched == expected
+
+
+def test_size_matched_tune_row_uses_whole_tune_split_when_test_is_larger() -> None:
+    events = [
+        make_event(Source.NVD, "CVE-1", 1),
+        make_event(Source.GHSA, "CVE-1", 2),
+        make_event(Source.NVD, "CVE-2", 3),
+        make_event(Source.NVD, "CVE-3", 4),
+        make_event(Source.NVD, "CVE-4", 5),
+    ]
+    vectors = pair_vectors([0.9], singles=3)
+    report = evaluate_holdout(events, vectors, (0.5, 0.95), train_fraction=0.25)
+    assert report.n_matched_cves == report.n_tune_cves == 1
+    assert report.results[0].tune_matched == report.results[0].tune
 
 
 def test_format_holdout_shows_na_precision_without_predicted_pairs() -> None:
