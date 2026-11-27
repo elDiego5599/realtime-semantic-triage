@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from semtriage.sanitize import find_identifiers, sanitize
@@ -21,14 +23,14 @@ def test_strips_urls():
     text = (
         "Details at https://github.com/advisories/GHSA-crj3-q72p-ggqm and http://example.com/x?y=1."
     )
-    assert sanitize(text) == "Details at and ."
+    assert sanitize(text) == "Details at ."
 
 
 def test_removes_brackets_left_empty():
     text = (
         "Stored XSS (CVE-2026-64670) in client [GHSA-crj3-q72p-ggqm] and ( https://nvd.nist.gov/x )"
     )
-    assert sanitize(text) == "Stored XSS in client and"
+    assert sanitize(text) == "Stored XSS in client"
 
 
 def test_collapses_whitespace_but_keeps_paragraphs():
@@ -160,3 +162,177 @@ def test_url_does_not_include_trailing_brace():
 
 def test_find_identifiers_only_matches_ascii_digits():
     assert find_identifiers("CVE-٢٠٢٦-١٢٣٤٥") == set()
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (
+            "Title\n\n**CVE:** This vulnerability corresponds to CVE-2026-12345.\n\n### Summary",
+            "Title\n\n### Summary",
+        ),
+        (
+            "**CVE:** This vulnerability corresponds to "
+            "[CVE-2026-12345](https://nvd.nist.gov/vuln/detail/CVE-2026-12345).",
+            "",
+        ),
+        ("This issue corresponds to GHSA-crj3-q72p-ggqm. More text.", "More text."),
+    ],
+)
+def test_removes_sentence_that_only_names_the_identifier(text, expected):
+    assert sanitize(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Intro\nCVE: CVE-2026-12345\nBody", "Intro\n\nBody"),
+        ("Intro\nCVE ID: CVE-2026-12345.\nBody", "Intro\n\nBody"),
+        ("Intro\n**GHSA:** GHSA-crj3-q72p-ggqm\nBody", "Intro\n\nBody"),
+        ("Intro\n- Fix commit: https://x.test/c/1\nBody", "Intro\n\nBody"),
+        ("Intro\nPatch: https://x.test/p\nBody", "Intro\n\nBody"),
+        ("Intro\n**Fix reference**: https://x.test/r\nBody", "Intro\n\nBody"),
+    ],
+)
+def test_removes_label_lines_left_without_a_value(text, expected):
+    assert sanitize(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("## References\n\n- https://x.test/a\n- https://x.test/b\n\nEnd", "## References\n\nEnd"),
+        ("List\n* GHSA-crj3-q72p-ggqm\nEnd", "List\n\nEnd"),
+        ("List\n- `https://x.test/a`: https://x.test/b\nEnd", "List\n\nEnd"),
+        ("List\n- `CVE-2026-12345` / `CVE-2026-12346`\nEnd", "List\n\nEnd"),
+    ],
+)
+def test_removes_list_items_left_without_content(text, expected):
+    assert sanitize(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Use `https://x.test/a` here", "Use here"),
+        ("Tracked as `CVE-2026-12345` upstream", "Tracked as upstream"),
+        ("Run `curl https://x.test/a` now", "Run `curl ` now"),
+    ],
+)
+def test_removes_inline_code_left_empty(text, expected):
+    assert sanitize(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (
+            "Incomplete fixes for CVE-2026-1111, CVE-2026-2222 and CVE-2026-3333.",
+            "Incomplete fixes for .",
+        ),
+        ("Bypass of CVE-2026-1111 / GHSA-crj3-q72p-ggqm in parser", "Bypass of in parser"),
+        ("See CVE-2026-1111 or CVE-2026-2222, both fixed", "See , both fixed"),
+    ],
+)
+def test_collapses_separators_between_removed_identifiers(text, expected):
+    assert sanitize(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "This field corresponds to the user id.",
+        "Each entry corresponds to one request, and a, b and c are parsed.",
+        "Fix: upgrade to 2.4.1.",
+        "CVE: pending assignment",
+        "- item one\n- item two",
+        "Set `--flag` and `` to disable",
+        "x = 1 / 2, or y | z",
+        "## Patches\n\n-\n\nNone.",
+        "Call f() and g[] and h(, ) as before.",
+        "Use ``` code ``` fences and `a`, `b`.",
+    ],
+)
+def test_residue_rules_leave_clean_text_untouched(text):
+    assert sanitize(text) == text
+
+
+def test_keeps_label_with_other_content_after_removal():
+    text = "Fix: upgrade, see https://x.test/a"
+    assert sanitize(text) == "Fix: upgrade, see"
+
+
+def test_keeps_list_item_with_words_after_removal():
+    text = "- https://x.test/a (upstream patch)"
+    assert sanitize(text) == "- (upstream patch)"
+
+
+def test_keeps_sentence_that_also_says_more():
+    text = "The vulnerabilities tracked by CVE-2026-1111 are related to parsing."
+    assert sanitize(text) == "The vulnerabilities tracked by are related to parsing."
+
+
+def test_url_does_not_swallow_closing_backtick():
+    assert sanitize("`https://x.test/a` text") == "text"
+
+
+def test_residue_rules_cannot_join_text_into_a_new_identifier():
+    text = "CVE-2026-`CVE-2025-11111`12345 and GHSA-crj3-CVE-2025-1 / CVE-2025-2-q72p-ggqm"
+    assert find_identifiers(sanitize(text)) == set()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "| https://x.test/a " + "| " * 40 + "| ok |",
+        "https://a.test" + ", " * 40 + "x",
+        "CVE-2026-1111 " + " and " * 40 + "x",
+    ],
+)
+def test_separator_rule_runs_in_linear_time(text):
+    start = time.perf_counter()
+    sanitize(text * 50)
+    assert time.perf_counter() - start < 1.0
+
+
+def test_template_sentence_rule_keeps_prose_after_the_identifier():
+    text = "This issue corresponds to CVE-2026-1111 in the parser and allows RCE."
+    assert sanitize(text) == "This issue corresponds to in the parser and allows RCE."
+
+
+def test_empty_inline_code_rule_does_not_merge_adjacent_code_spans():
+    assert sanitize("`a`https://x.test/b`b`") == "`a``b`"
+
+
+def test_label_rule_allows_at_most_one_word_before_the_label():
+    assert sanitize("Apply the fix: https://x.test/a") == "Apply the fix:"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Intro\r\nCVE: CVE-2026-12345\r\nBody", "Intro\n\nBody"),
+        ("Intro\r\n- https://x.test/a\r\nBody", "Intro\n\nBody"),
+    ],
+)
+def test_residue_rules_handle_crlf_line_endings(text, expected):
+    assert sanitize(text) == expected
+
+
+def test_punctuation_line_rule_runs_in_linear_time():
+    text = " " * 100_000 + "CVE-2026-12345" + " " * 100_000 + "x"
+    start = time.perf_counter()
+    sanitize(text)
+    assert time.perf_counter() - start < 1.0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Unrelated issue: CVE-2026-12345", "Unrelated issue:"),
+        ("Disclosure report: https://x.test/a", "Disclosure report:"),
+        ("Bad commit: https://x.test/c", "Bad commit:"),
+    ],
+)
+def test_label_rule_keeps_lines_whose_label_has_a_free_word(text, expected):
+    assert sanitize(text) == expected
