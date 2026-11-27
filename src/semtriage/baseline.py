@@ -2,6 +2,7 @@
 
 import argparse
 import math
+import zipfile
 from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -293,41 +294,103 @@ class BaselineReport:
     reference: ReferenceRow | None = None
 
 
+def labeled_events(events: Iterable[Event]) -> tuple[list[Event], dict[str, str], int]:
+    """Keep events with a single CVE label; return them, their gold map and the excluded count."""
+    materialized = list(events)
+    kept: list[Event] = []
+    gold: dict[str, str] = {}
+    for event in materialized:
+        label = gold_label(event)
+        if label is not None:
+            kept.append(event)
+            gold[event.event_id] = label
+    return kept, gold, len(materialized) - len(kept)
+
+
+def write_embeddings(
+    path: str | Path,
+    ids: Sequence[str],
+    vectors: np.ndarray,
+    *,
+    embedder: str,
+) -> None:
+    """Save event ids, float32 vectors and the embedder name to one .npz file at `path`."""
+    matrix = np.asarray(vectors, dtype=np.float32)
+    if matrix.ndim != 2 or len(matrix) != len(ids):
+        raise ValueError(f"vectors must be 2-D with {len(ids)} rows, got shape {matrix.shape}")
+    with Path(path).open("wb") as target:
+        np.savez(
+            target,
+            event_ids=np.asarray(list(ids), dtype=str),
+            vectors=matrix,
+            embedder=np.asarray(embedder, dtype=str),
+        )
+
+
+def read_embeddings(path: str | Path, ids: Sequence[str]) -> tuple[np.ndarray, str]:
+    """Load cached vectors, refusing them unless their event ids equal `ids` in order."""
+    try:
+        with np.load(Path(path), allow_pickle=False) as data:
+            arrays = {key: data[key] for key in data.files}
+    except (OSError, ValueError, AttributeError, zipfile.BadZipFile, EOFError) as exc:
+        raise ValueError(f"{path}: cannot read embeddings file ({exc})") from exc
+    missing = {"event_ids", "vectors", "embedder"} - set(arrays)
+    if missing:
+        raise ValueError(f"{path}: embeddings file is missing {sorted(missing)}")
+    stored_ids, vectors = arrays["event_ids"], arrays["vectors"]
+    embedder = str(arrays["embedder"])
+    if stored_ids.ndim != 1 or vectors.ndim != 2 or len(vectors) != len(stored_ids):
+        raise ValueError(
+            f"{path}: bad shape, event_ids {stored_ids.shape} and vectors {vectors.shape}"
+        )
+    if stored_ids.tolist() != list(ids):
+        raise ValueError(
+            f"{path}: event ids do not match the labeled events "
+            f"({len(stored_ids)} stored, {len(ids)} expected, same order required)"
+        )
+    return vectors.astype(np.float32, copy=False), embedder
+
+
 def run_baseline(
     events: Iterable[Event],
-    embedder: Embedder,
+    embedder: Embedder | None,
     thresholds: Sequence[float],
     *,
     pairs: str = "cross-source",
+    save_embeddings: str | Path | None = None,
+    load_embeddings: str | Path | None = None,
 ) -> BaselineReport:
-    """Embed and evaluate the labeled subset of advisory events."""
+    """Embed (or load cached vectors for) the labeled subset of events and evaluate it."""
     if pairs not in PAIR_MODES:
         raise ValueError(f"pairs must be one of {PAIR_MODES}, got {pairs!r}")
-    materialized = list(events)
-    kept_with_labels = [
-        (event, label) for event in materialized if (label := gold_label(event)) is not None
-    ]
-    kept = [event for event, _ in kept_with_labels]
-    n_excluded = len(materialized) - len(kept)
+    if (embedder is None) == (load_embeddings is None):
+        raise ValueError("pass exactly one of embedder and load_embeddings")
+    kept, gold, n_excluded = labeled_events(events)
     if not kept:
         raise ValueError("No labeled events to evaluate")
+    ids = [event.event_id for event in kept]
 
-    vectors = embedder.embed([sanitize(event.text) for event in kept])
-    gold = {event.event_id: label for event, label in kept_with_labels}
+    if embedder is None:
+        vectors, embedder_name = read_embeddings(load_embeddings, ids)
+    else:
+        vectors = embedder.embed([sanitize(event.text) for event in kept])
+        embedder_name = embedder.name
+    if save_embeddings is not None:
+        write_embeddings(save_embeddings, ids, vectors, embedder=embedder_name)
     rows = sweep(
-        [event.event_id for event in kept],
+        ids,
         vectors,
         gold,
         thresholds,
         groups=[event.source for event in kept] if pairs == "cross-source" else None,
     )
     return BaselineReport(
-        embedder=embedder.name,
+        embedder=embedder_name,
         n_events=len(kept),
         n_excluded=n_excluded,
         rows=rows,
         pairs=pairs,
-        reference=singletons_reference([event.event_id for event in kept], gold),
+        reference=singletons_reference(ids, gold),
     )
 
 
@@ -419,8 +482,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--embedder",
         choices=("hashing", "bge-m3"),
-        default="hashing",
-        help="Embedding implementation",
+        default=None,
+        help="Embedding implementation (default: hashing)",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Run bge-m3 in half precision (only with --embedder bge-m3)",
     )
     parser.add_argument(
         "--thresholds",
@@ -434,15 +502,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="cross-source",
         help="Candidate pair mode: cross-source joins only events from different sources",
     )
+    cache = parser.add_mutually_exclusive_group()
+    cache.add_argument(
+        "--save-embeddings",
+        type=Path,
+        metavar="PATH",
+        help="Save event ids and float32 vectors of the labeled events to this .npz file",
+    )
+    cache.add_argument(
+        "--load-embeddings",
+        type=Path,
+        metavar="PATH",
+        help="Load vectors from a --save-embeddings file instead of embedding",
+    )
     args = parser.parse_args(argv)
+    if args.load_embeddings is not None and (args.embedder is not None or args.fp16):
+        parser.error("--load-embeddings cannot be combined with --embedder or --fp16")
+    if args.fp16 and args.embedder != "bge-m3":
+        parser.error("--fp16 requires --embedder bge-m3")
     if not args.events.is_file():
         parser.error(f"events file not found: {args.events}")
 
-    embedder: Embedder
-    if args.embedder == "hashing":
-        embedder = HashingEmbedder()
-    else:
-        embedder = BgeM3Embedder()
+    embedder: Embedder | None = None
+    if args.load_embeddings is None:
+        if args.embedder == "bge-m3":
+            embedder = BgeM3Embedder(use_fp16=args.fp16)
+        else:
+            embedder = HashingEmbedder()
 
     try:
         report = run_baseline(
@@ -450,6 +536,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             embedder,
             args.thresholds,
             pairs=args.pairs,
+            save_embeddings=args.save_embeddings,
+            load_embeddings=args.load_embeddings,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -465,12 +553,15 @@ __all__ = [
     "SweepRow",
     "format_report",
     "gold_label",
+    "labeled_events",
     "load_events",
     "main",
+    "read_embeddings",
     "run_baseline",
     "singletons_reference",
     "sweep",
     "threshold_clusters",
+    "write_embeddings",
 ]
 
 
