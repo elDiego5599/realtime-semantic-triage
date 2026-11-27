@@ -504,9 +504,9 @@ def read_embeddings(
 
     `ids` must equal the stored event ids in order, and `texts` (the embedded texts
     of those events) must hash to the stored digest, so stale vectors are never reused.
-    When `text_mode` is given and the file records one (files written before text
-    modes existed do not), a different label is refused with a clearer message;
-    the hash check alone already refuses texts built with another mode.
+    When `text_mode` is given, a different stored label is refused with a clearer
+    message than the hash check would give. Files written before text modes
+    existed carry no label and count as `full`, as in `read_text_mode`.
     """
     try:
         with np.load(Path(path), allow_pickle=False) as data:
@@ -527,8 +527,8 @@ def read_embeddings(
             f"{path}: event ids do not match the labeled events "
             f"({len(stored_ids)} stored, {len(ids)} expected, same order required)"
         )
-    stored_mode = str(arrays["text_mode"]) if "text_mode" in arrays else None
-    if text_mode is not None and stored_mode is not None and stored_mode != text_mode:
+    stored_mode = str(arrays["text_mode"]) if "text_mode" in arrays else "full"
+    if text_mode is not None and stored_mode != text_mode:
         raise ValueError(
             f"{path}: text mode differs: cache built with {stored_mode}, "
             f"this run uses {text_mode}; re-embed or use the same mode"

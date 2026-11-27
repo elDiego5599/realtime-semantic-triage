@@ -392,22 +392,35 @@ def test_truncate_cuts_at_any_whitespace():
     assert truncate_text("alpha beta", 7) == "alpha"
 
 
-def test_old_cache_without_text_mode_key_still_loads(tmp_path):
-    events = sample_events()
+def _write_unlabeled_full_cache(path, events):
     ids = [event.event_id for event in events]
-    texts = [build_text(event, "lead") for event in events]
-    vectors = HashingEmbedder().embed(texts)
-    path = tmp_path / "old.npz"
+    texts = [build_text(event, "full") for event in events]
     with path.open("wb") as target:
         np.savez(
             target,
             event_ids=np.asarray(ids, dtype=str),
-            vectors=vectors,
+            vectors=HashingEmbedder().embed(texts),
             embedder=np.asarray("hashing-256", dtype=str),
             text_sha256=np.asarray(texts_sha256(texts), dtype=str),
         )
-    report = run_baseline(events, None, (0.5,), text_mode="lead", load_embeddings=path)
+
+
+def test_old_cache_without_text_mode_key_still_loads(tmp_path):
+    events = sample_events()
+    path = tmp_path / "old.npz"
+    _write_unlabeled_full_cache(path, events)
+    report = run_baseline(events, None, (0.5,), load_embeddings=path)
     assert report.n_events == len(events)
+
+
+def test_old_cache_without_text_mode_key_counts_as_full(tmp_path):
+    events = sample_events()
+    path = tmp_path / "old.npz"
+    _write_unlabeled_full_cache(path, events)
+    with pytest.raises(
+        ValueError, match="text mode differs: cache built with full, this run uses lead:1000"
+    ):
+        run_baseline(events, None, (0.5,), text_mode="lead", load_embeddings=path)
 
 
 def test_lead_mode_falls_back_to_full_text_when_lead_is_empty():
