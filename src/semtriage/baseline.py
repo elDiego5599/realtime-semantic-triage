@@ -31,6 +31,8 @@ DEFAULT_THRESHOLDS: tuple[float, ...] = (
 
 PAIR_MODES: tuple[str, ...] = ("cross-source", "all")
 
+RULES: tuple[str, ...] = ("single-link", "mutual-best")
+
 
 def gold_label(event: Event) -> str | None:
     """Return the event's sole CVE label, if it has exactly one."""
@@ -224,6 +226,110 @@ def edge_clusters(n_rows: int, lefts: np.ndarray, rights: np.ndarray) -> list[in
     return union_find.labels()
 
 
+def _check_rule(rule: str) -> None:
+    """Reject an unknown linking rule."""
+    if rule not in RULES:
+        raise ValueError(f"rule must be one of {RULES}, got {rule!r}")
+
+
+def mutual_best_pairs(
+    vectors: np.ndarray,
+    groups: Sequence[Hashable] | None,
+    *,
+    block_rows: int = _BLOCK_ROWS,
+) -> _Edges:
+    """Return (similarities, lefts, rights) of mutual best matches between two groups.
+
+    Each row's best match is its most similar row (dot product) in the other group.
+    A pair is returned when each row is the other's best match, at any similarity, so
+    a threshold can be applied afterwards. Ties go to the lowest row index: argmax
+    picks the first maximum and the running column maximum only moves on a strictly
+    greater value. The larger group is walked in blocks of `block_rows` rows against
+    the whole smaller group, so the full matrix is never built. Pairs come with
+    left < right (int32), ordered by left. With fewer than two groups there are no
+    pairs; more than two groups raise ValueError.
+    """
+    if groups is None:
+        raise ValueError("the mutual-best rule needs groups (cross-source pairs)")
+    if block_rows < 1:
+        raise ValueError("block_rows must be at least 1")
+    matrix = _finite_matrix(vectors)
+    if len(groups) != len(matrix):
+        raise ValueError("groups must have the same length as vectors")
+    rows_by_group: dict[Hashable, list[int]] = {}
+    for row, group in enumerate(groups):
+        rows_by_group.setdefault(group, []).append(row)
+    if len(rows_by_group) > 2:
+        raise ValueError("the mutual-best rule needs at most two groups")
+    if len(rows_by_group) < 2:
+        return _sorted_edges([], [], [])
+    first, second = (np.asarray(rows, dtype=np.int32) for rows in rows_by_group.values())
+    outer, inner = (first, second) if len(first) >= len(second) else (second, first)
+
+    inner_matrix = matrix[inner]
+    outer_best = np.empty(len(outer), dtype=np.int64)
+    outer_similarity = np.empty(len(outer), dtype=np.float64)
+    inner_best = np.zeros(len(inner), dtype=np.int64)
+    inner_similarity = np.full(len(inner), -np.inf)
+    columns = np.arange(len(inner))
+    for start in range(0, len(outer), block_rows):
+        block = matrix[outer[start : start + block_rows]] @ inner_matrix.T
+        stop = start + len(block)
+        best = block.argmax(axis=1)
+        outer_best[start:stop] = best
+        outer_similarity[start:stop] = block[np.arange(len(block)), best]
+        column_best = block.argmax(axis=0)
+        column_similarity = block[column_best, columns]
+        better = column_similarity > inner_similarity
+        inner_similarity[better] = column_similarity[better]
+        inner_best[better] = column_best[better] + start
+
+    mutual = inner_best[outer_best] == np.arange(len(outer))
+    rows = outer[mutual]
+    cols = inner[outer_best[mutual]]
+    lefts = np.minimum(rows, cols)
+    order = np.argsort(lefts, kind="stable")
+    return (
+        outer_similarity[mutual][order],
+        lefts[order],
+        np.maximum(rows, cols)[order],
+    )
+
+
+def _mutual_labels_by_threshold(
+    vectors: np.ndarray,
+    thresholds: Sequence[float],
+    groups: Sequence[Hashable] | None,
+    *,
+    block_rows: int = _BLOCK_ROWS,
+) -> dict[float, list[int]]:
+    """Label rows for each distinct threshold from one pass of mutual best matches."""
+    _check_thresholds(thresholds)
+    similarities, lefts, rights = mutual_best_pairs(vectors, groups, block_rows=block_rows)
+    labels: dict[float, list[int]] = {}
+    for threshold in set(thresholds):
+        keep = similarities >= threshold
+        labels[threshold] = edge_clusters(len(vectors), lefts[keep], rights[keep])
+    return labels
+
+
+def mutual_best_clusters(
+    vectors: np.ndarray,
+    threshold: float,
+    groups: Sequence[Hashable] | None,
+    *,
+    block_rows: int = _BLOCK_ROWS,
+) -> list[int]:
+    """Cluster rows by mutual best cross-group matches at or above a threshold.
+
+    Clusters are the connected components of the kept pairs (at most two rows each),
+    labeled by their smallest row index, as in `edge_clusters`.
+    """
+    return _mutual_labels_by_threshold(vectors, [threshold], groups, block_rows=block_rows)[
+        threshold
+    ]
+
+
 def threshold_clusters(
     vectors: np.ndarray,
     threshold: float,
@@ -275,8 +381,10 @@ def sweep(
     thresholds: Sequence[float],
     *,
     groups: Sequence[Hashable] | None = None,
+    rule: str = "single-link",
 ) -> list[SweepRow]:
-    """Sweep thresholds efficiently using a shared similarity matrix."""
+    """Sweep thresholds, computing similarities (or mutual best matches) only once."""
+    _check_rule(rule)
     if len(ids) != len(vectors):
         raise ValueError("ids and vectors must have the same length")
     if groups is not None and len(groups) != len(vectors):
@@ -285,7 +393,10 @@ def sweep(
         raise ValueError("ids must be unique")
     if set(ids) != set(gold):
         raise ValueError("ids and gold must contain the same item IDs")
-    labels_by_threshold = _labels_by_threshold(vectors, thresholds, groups=groups)
+    if rule == "mutual-best":
+        labels_by_threshold = _mutual_labels_by_threshold(vectors, thresholds, groups)
+    else:
+        labels_by_threshold = _labels_by_threshold(vectors, thresholds, groups=groups)
 
     rows: list[SweepRow] = []
     for threshold in thresholds:
@@ -314,6 +425,7 @@ class BaselineReport:
     rows: list[SweepRow]
     pairs: str | None = None
     reference: ReferenceRow | None = None
+    rule: str = "single-link"
 
 
 def labeled_events(events: Iterable[Event]) -> tuple[list[Event], dict[str, str], int]:
@@ -410,12 +522,16 @@ def run_baseline(
     thresholds: Sequence[float],
     *,
     pairs: str = "cross-source",
+    rule: str = "single-link",
     save_embeddings: str | Path | None = None,
     load_embeddings: str | Path | None = None,
 ) -> BaselineReport:
     """Embed (or load cached vectors for) the labeled subset of events and evaluate it."""
     if pairs not in PAIR_MODES:
         raise ValueError(f"pairs must be one of {PAIR_MODES}, got {pairs!r}")
+    _check_rule(rule)
+    if rule == "mutual-best" and pairs != "cross-source":
+        raise ValueError("the mutual-best rule needs cross-source pairs")
     if (embedder is None) == (load_embeddings is None):
         raise ValueError("pass exactly one of embedder and load_embeddings")
     kept, gold, n_excluded = labeled_events(events)
@@ -437,6 +553,7 @@ def run_baseline(
         gold,
         thresholds,
         groups=[event.source for event in kept] if pairs == "cross-source" else None,
+        rule=rule,
     )
     return BaselineReport(
         embedder=embedder_name,
@@ -445,6 +562,7 @@ def run_baseline(
         rows=rows,
         pairs=pairs,
         reference=singletons_reference(ids, gold),
+        rule=rule,
     )
 
 
@@ -470,6 +588,8 @@ def format_report(report: BaselineReport) -> str:
     ]
     if report.pairs is not None:
         lines.append(f"Pairs: {report.pairs}")
+    if report.rule != "single-link":
+        lines.append(f"Rule: {report.rule}")
     lines += [
         "",
         "| threshold | clusters | pairwise P | pairwise R | pairwise F1 | B3 P | B3 R | B3 F1 |",
@@ -556,6 +676,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="cross-source",
         help="Candidate pair mode: cross-source joins only events from different sources",
     )
+    parser.add_argument(
+        "--rule",
+        choices=RULES,
+        default="single-link",
+        help="Linking rule: mutual-best joins two events only if each is the other's "
+        "most similar cross-source event (needs --pairs cross-source)",
+    )
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument(
         "--save-embeddings",
@@ -574,6 +701,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--load-embeddings cannot be combined with --embedder or --fp16")
     if args.fp16 and args.embedder != "bge-m3":
         parser.error("--fp16 requires --embedder bge-m3")
+    if args.rule == "mutual-best" and args.pairs != "cross-source":
+        parser.error("--rule mutual-best requires --pairs cross-source")
     if not args.events.is_file():
         parser.error(f"events file not found: {args.events}")
 
@@ -590,6 +719,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             embedder,
             args.thresholds,
             pairs=args.pairs,
+            rule=args.rule,
             save_embeddings=args.save_embeddings,
             load_embeddings=args.load_embeddings,
         )
@@ -602,6 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "DEFAULT_THRESHOLDS",
     "PAIR_MODES",
+    "RULES",
     "BaselineReport",
     "ReferenceRow",
     "SweepRow",
@@ -612,6 +743,8 @@ __all__ = [
     "labeled_events",
     "load_events",
     "main",
+    "mutual_best_clusters",
+    "mutual_best_pairs",
     "read_embeddings",
     "run_baseline",
     "singletons_reference",

@@ -9,6 +9,7 @@ import pytest
 from semtriage.baseline import (
     DEFAULT_THRESHOLDS,
     PAIR_MODES,
+    RULES,
     BaselineReport,
     SweepRow,
     candidate_edges,
@@ -17,6 +18,8 @@ from semtriage.baseline import (
     gold_label,
     load_events,
     main,
+    mutual_best_clusters,
+    mutual_best_pairs,
     run_baseline,
     singletons_reference,
     sweep,
@@ -689,3 +692,238 @@ def test_edge_clusters_match_threshold_clusters(threshold, groups):
     assert np.all(lefts < rights)
     expected = threshold_clusters(ABC, threshold, groups=groups)
     assert edge_clusters(len(ABC), lefts, rights) == expected
+
+
+# Row 0 (nvd) and row 1 (ghsa) are the true pair (dot 0.9). Row 2 (nvd) has its best
+# match in row 1 (dot 0.8), but row 1 prefers row 0, so only single link chains row 2 in.
+CHAIN = np.array([[0.9, np.sqrt(0.19)], [1.0, 0.0], [0.8, -0.6]])
+CHAIN_GROUPS = ["nvd", "ghsa", "nvd"]
+
+
+def brute_force_mutual(vectors, groups, threshold):
+    """Reference rule from the full cross matrix (lowest index wins ties)."""
+    groups = np.asarray(groups)
+    first, second = np.unique(groups)[:2]
+    rows_a = np.flatnonzero(groups == first)
+    rows_b = np.flatnonzero(groups == second)
+    full = vectors[rows_a] @ vectors[rows_b].T
+    best_b = full.argmax(axis=1)
+    best_a = full.argmax(axis=0)
+    labels = list(range(len(vectors)))
+    for i, j in enumerate(best_b):
+        if best_a[j] == i and full[i, j] >= threshold:
+            left, right = sorted((int(rows_a[i]), int(rows_b[j])))
+            labels[right] = left
+    return labels
+
+
+def test_rules():
+    assert RULES == ("single-link", "mutual-best")
+
+
+def test_mutual_best_links_only_true_pair_where_single_link_chains():
+    single = sweep(
+        ["a", "b", "c"],
+        CHAIN,
+        {"a": "X", "b": "X", "c": "Y"},
+        [0.7],
+        groups=CHAIN_GROUPS,
+    )[0]
+    mutual = sweep(
+        ["a", "b", "c"],
+        CHAIN,
+        {"a": "X", "b": "X", "c": "Y"},
+        [0.7],
+        groups=CHAIN_GROUPS,
+        rule="mutual-best",
+    )[0]
+    assert single.n_clusters == 1
+    assert mutual.n_clusters == 2
+    assert mutual.pairwise.f1 == 1.0
+    assert mutual_best_clusters(CHAIN, 0.7, CHAIN_GROUPS) == [0, 0, 2]
+
+
+def test_mutual_best_pairs_output():
+    similarities, lefts, rights = mutual_best_pairs(CHAIN, CHAIN_GROUPS)
+    assert lefts.tolist() == [0]
+    assert rights.tolist() == [1]
+    assert similarities.tolist() == pytest.approx([0.9])
+    assert lefts.dtype == np.int32
+    assert rights.dtype == np.int32
+
+
+def test_threshold_cuts_mutual_pair_and_keeps_exact_match():
+    # 1 * 0.5 + 0 * sqrt(0.75) is exactly 0.5 in binary floating point.
+    vectors = np.array([[1.0, 0.0], [0.5, np.sqrt(0.75)]])
+    groups = ["nvd", "ghsa"]
+    assert mutual_best_clusters(vectors, 0.5, groups) == [0, 0]
+    assert mutual_best_clusters(vectors, np.nextafter(0.5, 1.0), groups) == [0, 1]
+
+
+@pytest.mark.parametrize("block_rows", [1, 2, 1024])
+def test_ties_pick_lowest_index(block_rows):
+    # Row 0 (ghsa) ties between nvd rows 1 and 2; nvd row 3 ties between ghsa rows 4 and 5.
+    vectors = np.array(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+    )
+    groups = ["ghsa", "nvd", "nvd", "nvd", "ghsa", "ghsa"]
+    _, lefts, rights = mutual_best_pairs(vectors, groups, block_rows=block_rows)
+    assert list(zip(lefts.tolist(), rights.tolist(), strict=True)) == [(0, 1), (3, 4)]
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_block_size_independence_and_brute_force(seed):
+    rng = np.random.default_rng(seed)
+    vectors = rng.normal(size=(41, 6))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    groups = rng.choice(["nvd", "ghsa"], size=len(vectors)).tolist()
+    small = mutual_best_pairs(vectors, groups, block_rows=1)
+    large = mutual_best_pairs(vectors, groups, block_rows=10_000)
+    # Pairs must match exactly; BLAS may round a block's dot products in the last bit.
+    np.testing.assert_array_equal(small[1], large[1])
+    np.testing.assert_array_equal(small[2], large[2])
+    np.testing.assert_allclose(small[0], large[0], rtol=0, atol=1e-12)
+    assert len(small[1]) > 0
+    for threshold in (-1.0, 0.0, 0.3, 0.6):
+        assert mutual_best_clusters(vectors, threshold, groups, block_rows=1) == (
+            brute_force_mutual(vectors, groups, threshold)
+        )
+
+
+def test_sweep_mutual_best_matches_per_threshold_clusters():
+    rng = np.random.default_rng(7)
+    vectors = rng.normal(size=(30, 4))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    groups = ["nvd" if i % 3 else "ghsa" for i in range(30)]
+    ids = [str(i) for i in range(30)]
+    gold = {item: int(item) // 2 for item in ids}
+    thresholds = [0.9, 0.2, 0.5, 0.2]
+    rows = sweep(ids, vectors, gold, thresholds, groups=groups, rule="mutual-best")
+    for row, threshold in zip(rows, thresholds, strict=True):
+        labels = mutual_best_clusters(vectors, threshold, groups)
+        pred = dict(zip(ids, labels, strict=True))
+        assert row.threshold == threshold
+        assert row.n_clusters == len(set(labels))
+        assert row.pairwise == pairwise_scores(pred, gold)
+        assert row.bcubed == bcubed_scores(pred, gold)
+
+
+def test_sweep_mutual_best_computes_best_matches_once(monkeypatch):
+    import semtriage.baseline as baseline
+
+    calls = []
+    original = baseline.mutual_best_pairs
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(baseline, "mutual_best_pairs", counting)
+    ids = ["a", "b", "c"]
+    sweep(
+        ids,
+        CHAIN,
+        {"a": 1, "b": 1, "c": 2},
+        [0.9, 0.7, 0.5],
+        groups=CHAIN_GROUPS,
+        rule="mutual-best",
+    )
+    assert len(calls) == 1
+
+
+def test_single_group_or_empty_gives_no_pairs():
+    vectors = np.array([[1.0, 0.0], [1.0, 0.0]])
+    assert mutual_best_clusters(vectors, -1.0, ["nvd", "nvd"]) == [0, 1]
+    assert mutual_best_clusters(np.empty((0, 2)), 0.5, []) == []
+
+
+def test_more_than_two_groups_rejected():
+    vectors = np.eye(3)
+    with pytest.raises(ValueError, match="two"):
+        mutual_best_pairs(vectors, ["a", "b", "c"])
+
+
+def test_mutual_best_requires_groups():
+    with pytest.raises(ValueError, match="groups"):
+        mutual_best_pairs(CHAIN, None)
+    with pytest.raises(ValueError, match="cross-source"):
+        sweep(["a", "b", "c"], CHAIN, {"a": 1, "b": 1, "c": 2}, [0.5], rule="mutual-best")
+
+
+def test_unknown_rule_rejected():
+    with pytest.raises(ValueError, match="rule"):
+        sweep(["a"], np.ones((1, 2)), {"a": 1}, [0.5], groups=["nvd"], rule="average")
+
+
+def cross_events() -> list[Event]:
+    return [
+        make_event("1", "heap overflow in libfoo", ("CVE-2024-0001",)),
+        make_event("2", "heap overflow in libfoo", ("CVE-2024-0001",), Source.GHSA),
+        make_event("3", "heap overflow in libbar", ("CVE-2024-0002",)),
+    ]
+
+
+def test_run_baseline_rule():
+    single = run_baseline(cross_events(), RecordingEmbedder(), [0.9])
+    assert single.rule == "single-link"
+    assert single.rows[0].n_clusters == 1
+    mutual = run_baseline(cross_events(), RecordingEmbedder(), [0.9], rule="mutual-best")
+    assert mutual.rule == "mutual-best"
+    assert mutual.rows[0].n_clusters == 2
+
+
+def test_run_baseline_rejects_mutual_best_with_all_pairs_before_embedding():
+    embedder = RecordingEmbedder()
+    with pytest.raises(ValueError, match="cross-source"):
+        run_baseline(cross_events(), embedder, [0.9], pairs="all", rule="mutual-best")
+    assert embedder.texts == []
+
+
+def test_mutual_best_rejects_bad_block_rows():
+    with pytest.raises(ValueError, match="block_rows"):
+        mutual_best_pairs(CHAIN, CHAIN_GROUPS, block_rows=0)
+
+
+def test_main_rejects_mutual_best_with_all_pairs_before_reading_events(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["--events", str(tmp_path / "missing.jsonl"), "--rule", "mutual-best", "--pairs", "all"]
+        )
+    assert excinfo.value.code == 2
+    assert "--rule mutual-best" in capsys.readouterr().err
+
+
+def test_run_baseline_rejects_unknown_rule():
+    with pytest.raises(ValueError, match="rule"):
+        run_baseline(cross_events(), RecordingEmbedder(), [0.9], rule="average")
+
+
+def test_main_rule_flag(tmp_path, capsys):
+    path = tmp_path / "events.jsonl"
+    write_jsonl(path, cross_events())
+    assert main(["--events", str(path), "--thresholds", "0.5"]) == 0
+    out = capsys.readouterr().out
+    assert "Rule:" not in out
+    assert main(["--events", str(path), "--thresholds", "0.5", "--rule", "mutual-best"]) == 0
+    out = capsys.readouterr().out
+    assert "Rule: mutual-best" in out.splitlines()
+    assert "| 0.50 | 2 |" in out
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--rule", "average"], ["--rule", "mutual-best", "--pairs", "all"]],
+)
+def test_main_rule_errors_are_usage_errors(tmp_path, extra):
+    path = tmp_path / "events.jsonl"
+    write_jsonl(path, cross_events())
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--events", str(path), *extra])
+    assert excinfo.value.code == 2
