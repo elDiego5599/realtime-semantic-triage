@@ -601,9 +601,16 @@ def run_baseline(
     )
 
 
+def precision_cell(pairwise: Scores, *, n_clusters: int, n_events: int) -> str:
+    """Pairwise precision as a table cell; n/a when no pair is predicted (all singletons)."""
+    if n_clusters == n_events:
+        return "n/a"
+    return f"{pairwise.precision:.3f}"
+
+
 def _table_row(label: str, n_clusters: int, pairwise: Scores, bcubed: Scores, n_events: int) -> str:
     """Format one table row; pairwise precision is n/a when no pair is predicted."""
-    precision = "n/a" if n_clusters == n_events else f"{pairwise.precision:.3f}"
+    precision = precision_cell(pairwise, n_clusters=n_clusters, n_events=n_events)
     return (
         f"| {label} | {n_clusters} | {precision} | {pairwise.recall:.3f} "
         f"| {pairwise.f1:.3f} | {bcubed.precision:.3f} | {bcubed.recall:.3f} "
@@ -672,7 +679,7 @@ def load_events(path: str | Path) -> list[Event]:
     return events
 
 
-def _parse_thresholds(value: str) -> tuple[float, ...]:
+def parse_thresholds(value: str) -> tuple[float, ...]:
     """Parse a comma-separated threshold sequence."""
     parts = [part.strip() for part in value.split(",") if part.strip()]
     if not parts:
@@ -714,7 +721,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--thresholds",
-        type=_parse_thresholds,
+        type=parse_thresholds,
         default=DEFAULT_THRESHOLDS,
         help="Comma-separated similarity thresholds",
     )
@@ -813,6 +820,8 @@ __all__ = [
     "main",
     "mutual_best_clusters",
     "mutual_best_pairs",
+    "parse_thresholds",
+    "precision_cell",
     "read_embeddings",
     "read_text_mode",
     "run_baseline",

@@ -30,6 +30,8 @@ from semtriage.baseline import (
     gold_label,
     labeled_events,
     load_events,
+    parse_thresholds,
+    precision_cell,
     read_embeddings,
     read_text_mode,
     sweep,
@@ -188,7 +190,7 @@ def evaluate_holdout(
 
 def _result_row(rule: str, split: str, row: SweepRow, n_events: int) -> str:
     """Format one table row; pairwise precision is n/a when no pair is predicted."""
-    precision = "n/a" if row.n_clusters == n_events else f"{row.pairwise.precision:.3f}"
+    precision = precision_cell(row.pairwise, n_clusters=row.n_clusters, n_events=n_events)
     return (
         f"| {rule} | {split} | {row.threshold:.2f} | {row.n_clusters} | {precision} "
         f"| {row.pairwise.recall:.3f} | {row.pairwise.f1:.3f} | {row.bcubed.f1:.3f} |"
@@ -241,17 +243,6 @@ def format_holdout(
     return "\n".join(lines)
 
 
-def _parse_thresholds(value: str) -> tuple[float, ...]:
-    """Parse a comma-separated threshold sequence."""
-    try:
-        thresholds = tuple(float(part) for part in value.split(",") if part.strip())
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("thresholds must be comma-separated floats") from exc
-    if not thresholds or any(not math.isfinite(threshold) for threshold in thresholds):
-        raise argparse.ArgumentTypeError("thresholds must be comma-separated finite floats")
-    return thresholds
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the held-out threshold check on cached vectors."""
     parser = argparse.ArgumentParser(
@@ -266,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--thresholds",
-        type=_parse_thresholds,
+        type=parse_thresholds,
         default=DEFAULT_THRESHOLDS,
         help="Comma-separated similarity thresholds (default 0.60 to 0.90 step 0.01)",
     )
