@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from semtriage.embed import BgeM3Embedder, Embedder, HashingEmbedder
 from semtriage.metrics import Scores, bcubed_scores, pairwise_scores
 from semtriage.models import Event
-from semtriage.sanitize import sanitize
+from semtriage.text_mode import DEFAULT_MAX_CHARS, TEXT_MODES, build_text, text_mode_label
 
 DEFAULT_THRESHOLDS: tuple[float, ...] = (
     0.5,
@@ -426,6 +426,8 @@ class BaselineReport:
     pairs: str | None = None
     reference: ReferenceRow | None = None
     rule: str = "single-link"
+    text_mode: str = "full"
+    max_chars: int = DEFAULT_MAX_CHARS
 
 
 def labeled_events(events: Iterable[Event]) -> tuple[list[Event], dict[str, str], int]:
@@ -458,10 +460,12 @@ def write_embeddings(
     vectors: np.ndarray,
     *,
     embedder: str,
+    text_mode: str = "full",
 ) -> None:
     """Save event ids, a hash of the embedded texts, float32 vectors and the embedder name.
 
-    `texts` are the exact (sanitized) texts that were embedded, in the order of `ids`.
+    `texts` are the exact (sanitized, possibly shortened) texts that were embedded,
+    in the order of `ids`; `text_mode` is the `text_mode_label` that built them.
     Everything goes to one .npz file at `path`.
     """
     matrix = np.asarray(vectors, dtype=np.float32)
@@ -476,18 +480,33 @@ def write_embeddings(
             vectors=matrix,
             embedder=np.asarray(embedder, dtype=str),
             text_sha256=np.asarray(texts_sha256(texts), dtype=str),
+            text_mode=np.asarray(text_mode, dtype=str),
         )
+
+
+def read_text_mode(path: str | Path) -> str:
+    """Return the text mode label stored in an embeddings file; files without one are full."""
+    try:
+        with np.load(Path(path), allow_pickle=False) as data:
+            return str(data["text_mode"]) if "text_mode" in data.files else "full"
+    except (OSError, ValueError, AttributeError, zipfile.BadZipFile, EOFError) as exc:
+        raise ValueError(f"{path}: cannot read embeddings file ({exc})") from exc
 
 
 def read_embeddings(
     path: str | Path,
     ids: Sequence[str],
     texts: Sequence[str],
+    *,
+    text_mode: str | None = None,
 ) -> tuple[np.ndarray, str]:
     """Load cached vectors, refusing them unless both ids and texts match what was saved.
 
-    `ids` must equal the stored event ids in order, and `texts` (the sanitized texts
+    `ids` must equal the stored event ids in order, and `texts` (the embedded texts
     of those events) must hash to the stored digest, so stale vectors are never reused.
+    When `text_mode` is given, a different stored label is refused with a clearer
+    message than the hash check would give. Files written before text modes
+    existed carry no label and count as `full`, as in `read_text_mode`.
     """
     try:
         with np.load(Path(path), allow_pickle=False) as data:
@@ -508,6 +527,12 @@ def read_embeddings(
             f"{path}: event ids do not match the labeled events "
             f"({len(stored_ids)} stored, {len(ids)} expected, same order required)"
         )
+    stored_mode = str(arrays["text_mode"]) if "text_mode" in arrays else "full"
+    if text_mode is not None and stored_mode != text_mode:
+        raise ValueError(
+            f"{path}: text mode differs: cache built with {stored_mode}, "
+            f"this run uses {text_mode}; re-embed or use the same mode"
+        )
     if str(arrays["text_sha256"]) != texts_sha256(texts):
         raise ValueError(
             f"{path}: sanitized texts differ from the ones embedded "
@@ -525,11 +550,17 @@ def run_baseline(
     rule: str = "single-link",
     save_embeddings: str | Path | None = None,
     load_embeddings: str | Path | None = None,
+    text_mode: str = "full",
+    max_chars: int = DEFAULT_MAX_CHARS,
 ) -> BaselineReport:
-    """Embed (or load cached vectors for) the labeled subset of events and evaluate it."""
+    """Embed (or load cached vectors for) the labeled subset of events and evaluate it.
+
+    `text_mode` and `max_chars` choose the embedded text (see `build_text`).
+    """
     if pairs not in PAIR_MODES:
         raise ValueError(f"pairs must be one of {PAIR_MODES}, got {pairs!r}")
     _check_rule(rule)
+    mode_label = text_mode_label(text_mode, max_chars)
     if rule == "mutual-best" and pairs != "cross-source":
         raise ValueError("the mutual-best rule needs cross-source pairs")
     if (embedder is None) == (load_embeddings is None):
@@ -538,15 +569,17 @@ def run_baseline(
     if not kept:
         raise ValueError("No labeled events to evaluate")
     ids = [event.event_id for event in kept]
-    texts = [sanitize(event.text) for event in kept]
+    texts = [build_text(event, text_mode, max_chars=max_chars) for event in kept]
 
     if embedder is None:
-        vectors, embedder_name = read_embeddings(load_embeddings, ids, texts)
+        vectors, embedder_name = read_embeddings(load_embeddings, ids, texts, text_mode=mode_label)
     else:
         vectors = embedder.embed(texts)
         embedder_name = embedder.name
     if save_embeddings is not None:
-        write_embeddings(save_embeddings, ids, texts, vectors, embedder=embedder_name)
+        write_embeddings(
+            save_embeddings, ids, texts, vectors, embedder=embedder_name, text_mode=mode_label
+        )
     rows = sweep(
         ids,
         vectors,
@@ -563,6 +596,8 @@ def run_baseline(
         pairs=pairs,
         reference=singletons_reference(ids, gold),
         rule=rule,
+        text_mode=text_mode,
+        max_chars=max_chars,
     )
 
 
@@ -590,6 +625,8 @@ def format_report(report: BaselineReport) -> str:
         lines.append(f"Pairs: {report.pairs}")
     if report.rule != "single-link":
         lines.append(f"Rule: {report.rule}")
+    if report.text_mode != "full":
+        lines.append(f"Text: {report.text_mode} (max {report.max_chars} chars)")
     lines += [
         "",
         "| threshold | clusters | pairwise P | pairwise R | pairwise F1 | B3 P | B3 R | B3 F1 |",
@@ -649,6 +686,17 @@ def _parse_thresholds(value: str) -> tuple[float, ...]:
     return thresholds
 
 
+def _positive_int(value: str) -> int:
+    """Parse a positive integer command-line value."""
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the offline baseline command-line interface."""
     parser = argparse.ArgumentParser(description="Run the offline deduplication baseline")
@@ -683,6 +731,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Linking rule: mutual-best joins two events only if each is the other's "
         "most similar cross-source event (needs --pairs cross-source)",
     )
+    parser.add_argument(
+        "--text-mode",
+        choices=TEXT_MODES,
+        default="full",
+        help="Text to embed: full sanitized text (default), truncate to --max-chars, "
+        "or lead (GHSA title plus Summary section or first paragraph, no code blocks; "
+        "NVD description), capped at --max-chars",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=f"Character cap for --text-mode truncate or lead (default {DEFAULT_MAX_CHARS})",
+    )
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument(
         "--save-embeddings",
@@ -703,6 +766,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--fp16 requires --embedder bge-m3")
     if args.rule == "mutual-best" and args.pairs != "cross-source":
         parser.error("--rule mutual-best requires --pairs cross-source")
+    if args.max_chars is not None and args.text_mode == "full":
+        parser.error("--max-chars requires --text-mode truncate or lead")
+    max_chars = DEFAULT_MAX_CHARS if args.max_chars is None else args.max_chars
     if not args.events.is_file():
         parser.error(f"events file not found: {args.events}")
 
@@ -722,6 +788,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             rule=args.rule,
             save_embeddings=args.save_embeddings,
             load_embeddings=args.load_embeddings,
+            text_mode=args.text_mode,
+            max_chars=max_chars,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -746,6 +814,7 @@ __all__ = [
     "mutual_best_clusters",
     "mutual_best_pairs",
     "read_embeddings",
+    "read_text_mode",
     "run_baseline",
     "singletons_reference",
     "sweep",
