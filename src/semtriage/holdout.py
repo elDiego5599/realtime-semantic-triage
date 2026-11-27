@@ -31,10 +31,11 @@ from semtriage.baseline import (
     labeled_events,
     load_events,
     read_embeddings,
+    read_text_mode,
     sweep,
 )
 from semtriage.models import Event
-from semtriage.sanitize import sanitize
+from semtriage.text_mode import build_text, parse_text_mode_label
 
 DEFAULT_THRESHOLDS: tuple[float, ...] = tuple(round(0.60 + 0.01 * step, 2) for step in range(31))
 
@@ -194,12 +195,19 @@ def _result_row(rule: str, split: str, row: SweepRow, n_events: int) -> str:
     )
 
 
-def format_holdout(report: HoldoutReport, *, embedder: str, n_excluded: int = 0) -> str:
+def format_holdout(
+    report: HoldoutReport, *, embedder: str, n_excluded: int = 0, text_mode: str = "full"
+) -> str:
     """Format a held-out report as markdown lines."""
     lines = [
         f"Embedder: {embedder}",
         f"Events: {report.n_tune_events + report.n_test_events} (excluded: {n_excluded})",
         "Pairs: cross-source",
+    ]
+    if text_mode != "full":
+        mode, max_chars = parse_text_mode_label(text_mode)
+        lines.append(f"Text: {mode} (max {max_chars} chars)")
+    lines += [
         f"Train fraction: {report.train_fraction}",
         f"Tune: {report.n_tune_events} events, {report.n_tune_cves} CVEs "
         f"(last CVE published {report.tune_end.isoformat()})",
@@ -273,15 +281,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"events file not found: {args.events}")
     try:
         kept, _, n_excluded = labeled_events(load_events(args.events))
+        label = read_text_mode(args.embeddings)
+        text_mode, max_chars = parse_text_mode_label(label)
         ids = [event.event_id for event in kept]
-        texts = [sanitize(event.text) for event in kept]
-        vectors, embedder = read_embeddings(args.embeddings, ids, texts)
+        texts = [build_text(event, text_mode, max_chars=max_chars) for event in kept]
+        vectors, embedder = read_embeddings(args.embeddings, ids, texts, text_mode=label)
         report = evaluate_holdout(
             kept, vectors, args.thresholds, train_fraction=args.train_fraction
         )
     except ValueError as exc:
         parser.error(str(exc))
-    print(format_holdout(report, embedder=embedder, n_excluded=n_excluded))
+    print(format_holdout(report, embedder=embedder, n_excluded=n_excluded, text_mode=label))
     return 0
 
 
