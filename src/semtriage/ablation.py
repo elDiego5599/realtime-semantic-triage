@@ -27,6 +27,27 @@ SERVER_TIMEOUT = 300
 MAC_CONFIGS = tuple(config for config in CONFIGS if config not in M3_CONFIGS)
 
 
+def load_runs(path: Path) -> dict[str, dict[str, list[str]]]:
+    """Load and validate a saved ablation run JSON file."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to read runs file {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("runs JSON top level must be an object")
+    for config, runs in data.items():
+        if not isinstance(config, str):
+            raise ValueError("runs config names must be strings")
+        if not isinstance(runs, dict):
+            raise ValueError(f"runs for config {config!r} must be an object")
+        for query_id, ids in runs.items():
+            if not isinstance(query_id, str):
+                raise ValueError("run query ids must be strings")
+            if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+                raise ValueError(f"run for query {query_id!r} in config {config!r} must be a list")
+    return data
+
+
 def _validate_configs(configs: Sequence[str]) -> tuple[str, ...]:
     requested = tuple(configs)
     for config in requested:
@@ -209,6 +230,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=",".join(MAC_CONFIGS),
         help="Comma-separated retrieval configs",
     )
+    parser.add_argument(
+        "--load-runs",
+        action="append",
+        type=Path,
+        default=[],
+        help="Load saved runs as additional table rows (repeatable)",
+    )
     parser.add_argument("--sparse-cache", type=Path, help="BGE-M3 sparse vector cache")
     parser.add_argument(
         "--train-fraction",
@@ -230,8 +258,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"embeddings file not found: {args.embeddings}")
 
     configs = tuple(part.strip() for part in args.configs.split(",") if part.strip())
+    if args.configs == "" and not args.load_runs:
+        parser.error('--configs "" requires --load-runs')
     try:
-        configs = _validate_configs(configs)
+        if args.configs == "":
+            configs = ()
+        else:
+            configs = _validate_configs(configs)
     except ValueError as exc:
         parser.error(str(exc))
     if any(config in M3_CONFIGS for config in configs) and args.sparse_cache is None:
@@ -239,6 +272,31 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         kept, _, _ = labeled_events(load_events(args.events))
+        _, test_indices = split_by_cve(kept, args.train_fraction)
+        query_ids = [kept[index].event_id for index in test_indices]
+        test_query_ids = set(query_ids)
+
+        loaded_runs: dict[str, dict[str, list[str]]] = {}
+        loaded_names: set[str] = set(configs)
+        for path in args.load_runs:
+            try:
+                file_runs = load_runs(path)
+            except ValueError as exc:
+                parser.error(str(exc))
+            for config, config_runs in file_runs.items():
+                if config in loaded_names:
+                    parser.error(
+                        f"loaded config name conflicts with computed or earlier config: {config}"
+                    )
+                loaded_names.add(config)
+                for query_id in config_runs:
+                    if query_id not in test_query_ids:
+                        parser.error(f"loaded run contains query id outside test split: {query_id}")
+                loaded_runs[config] = config_runs
+
+        if not configs and not loaded_runs:
+            parser.error("no runs to score")
+
         text_label = read_text_mode(args.embeddings)
         text_mode, max_chars = parse_text_mode_label(text_label)
         ids = [event.event_id for event in kept]
@@ -249,22 +307,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.sparse_cache is not None
             else None
         )
-        _, test_indices = split_by_cve(kept, args.train_fraction)
 
-        sparse = bm25_encoder()
-        client = make_client(args.index_path, args.qdrant_url)
-        query_ids = [kept[index].event_id for index in test_indices]
-        runs = collect_runs(
-            kept,
-            dense,
-            texts,
-            sparse,
-            configs,
-            train_fraction=args.train_fraction,
-            client=client,
-            m3=m3,
-        )
+        if configs:
+            sparse = bm25_encoder()
+            client = make_client(args.index_path, args.qdrant_url)
+            runs = collect_runs(
+                kept,
+                dense,
+                texts,
+                sparse,
+                configs,
+                train_fraction=args.train_fraction,
+                client=client,
+                m3=m3,
+            )
+        else:
+            runs = {}
+
         reports = _reports_from_runs(kept, runs, query_ids)
+        if loaded_runs:
+            loaded_reports = _reports_from_runs(kept, loaded_runs, query_ids)
+            reports.update(loaded_reports)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -277,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "collect_runs",
     "format_ablation",
+    "load_runs",
     "make_client",
     "main",
     "run_ablation",

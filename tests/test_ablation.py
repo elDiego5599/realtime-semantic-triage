@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -164,6 +165,295 @@ def test_save_runs_json_roundtrip(tmp_path: Path, monkeypatch) -> None:
     data = json.loads(saved.read_text())
     assert set(data) == {"dense"}
     assert all(isinstance(ids, list) for ids in data["dense"].values())
+
+
+def test_load_runs_adds_rows(tmp_path: Path, monkeypatch, capsys) -> None:
+    events_path, embeddings_path, events, _ = write_mode_inputs(tmp_path, "full")
+    _, test_indices = ablation.split_by_cve(events, 0.7)
+    tower_runs: dict[str, list[str]] = {}
+    for index in test_indices:
+        query = events[index]
+        relevant = next(
+            (
+                event.event_id
+                for event in events
+                if event.event_id != query.event_id
+                and event.source != query.source
+                and event.published <= query.published
+                and set(event.cve_ids) & set(query.cve_ids)
+            ),
+            None,
+        )
+        if relevant is not None:
+            tower_runs[query.event_id] = [relevant]
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({"tower": tower_runs}))
+    monkeypatch.setattr(ablation, "bm25_encoder", lambda: FakeSparse())
+    assert (
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "dense",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    dense_row = out.index("| dense |")
+    tower_row = out.index("| tower |")
+    assert dense_row < tower_row
+    assert "| tower | 1.000 " in out
+
+
+def test_load_runs_only_skips_index(tmp_path: Path, monkeypatch, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({"tower": {}}))
+    monkeypatch.setattr(
+        ablation,
+        "build_index",
+        lambda *args, **kwargs: pytest.fail("build_index must not be called"),
+    )
+    monkeypatch.setattr(
+        ablation,
+        "make_client",
+        lambda *args, **kwargs: pytest.fail("make_client must not be called"),
+    )
+    monkeypatch.setattr(
+        ablation,
+        "bm25_encoder",
+        lambda: pytest.fail("bm25_encoder must not be called"),
+    )
+    assert (
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+        == 0
+    )
+    assert "| tower |" in capsys.readouterr().out
+
+
+def test_load_runs_rejects_unknown_query(tmp_path: Path, monkeypatch, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({"tower": {"nvd:unknown": []}}))
+    monkeypatch.setattr(
+        ablation,
+        "collect_runs",
+        lambda *args, **kwargs: pytest.fail("collect_runs must not be called"),
+    )
+    monkeypatch.setattr(
+        ablation,
+        "make_client",
+        lambda *args, **kwargs: pytest.fail("make_client must not be called"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "outside test split" in capsys.readouterr().err
+
+
+def test_load_runs_rejects_name_clash(tmp_path: Path, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps({"tower": {}}))
+    second.write_text(json.dumps({"tower": {}}))
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "",
+                "--load-runs",
+                str(first),
+                "--load-runs",
+                str(second),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "conflicts" in capsys.readouterr().err
+
+
+def test_load_runs_rejects_computed_name_clash(tmp_path: Path, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({"dense": {}}))
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "dense",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "conflicts" in capsys.readouterr().err
+
+
+def test_load_runs_rejects_bad_json(tmp_path: Path, monkeypatch, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text("{bad")
+    monkeypatch.setattr(
+        ablation,
+        "collect_runs",
+        lambda *args, **kwargs: pytest.fail("collect_runs must not be called"),
+    )
+    monkeypatch.setattr(
+        ablation,
+        "make_client",
+        lambda *args, **kwargs: pytest.fail("make_client must not be called"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "unable to read runs file" in capsys.readouterr().err
+
+
+def test_load_runs_rejects_top_level_list(tmp_path: Path) -> None:
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text("[]")
+    with pytest.raises(ValueError, match="top level must be an object"):
+        ablation.load_runs(loaded)
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        {"tower": ["nvd:CVE-5"]},
+        {"tower": {"nvd:CVE-5": ["nvd:CVE-5", 7]}},
+    ],
+)
+def test_load_runs_rejects_invalid_rankings(tmp_path: Path, runs) -> None:
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps(runs))
+    with pytest.raises(ValueError):
+        ablation.load_runs(loaded)
+
+
+def test_partial_loaded_run_scores(tmp_path: Path, capsys) -> None:
+    events_path, embeddings_path, events, _ = write_mode_inputs(tmp_path, "full")
+    _, test_indices = ablation.split_by_cve(events, 0.7)
+    query = events[test_indices[0]]
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({"tower": {query.event_id: []}}))
+    assert (
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+        == 0
+    )
+    assert "| tower |" in capsys.readouterr().out
+
+
+def test_save_runs_with_load_runs_saves_only_computed(tmp_path: Path, monkeypatch) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    monkeypatch.setattr(ablation, "bm25_encoder", lambda: FakeSparse())
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({"tower": {}}))
+    saved = tmp_path / "saved.json"
+    assert (
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "dense",
+                "--load-runs",
+                str(loaded),
+                "--save-runs",
+                str(saved),
+            ]
+        )
+        == 0
+    )
+    assert set(json.loads(saved.read_text())) == {"dense"}
+
+
+def test_empty_loaded_file_has_no_runs_to_score(tmp_path: Path, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text("{}")
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(
+            [
+                "--events",
+                events_path,
+                "--embeddings",
+                embeddings_path,
+                "--configs",
+                "",
+                "--load-runs",
+                str(loaded),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "no runs to score" in capsys.readouterr().err
+
+
+def test_empty_configs_without_load_runs_rejected(tmp_path: Path, capsys) -> None:
+    events_path, embeddings_path, _, _ = write_mode_inputs(tmp_path, "full")
+    with pytest.raises(SystemExit) as exc:
+        ablation.main(["--events", events_path, "--embeddings", embeddings_path, "--configs", ""])
+    assert exc.value.code == 2
+    assert "requires --load-runs" in capsys.readouterr().err
 
 
 def test_cli_rejects_unknown_config(tmp_path: Path) -> None:
