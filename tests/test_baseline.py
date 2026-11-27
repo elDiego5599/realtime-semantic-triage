@@ -11,6 +11,8 @@ from semtriage.baseline import (
     PAIR_MODES,
     BaselineReport,
     SweepRow,
+    candidate_edges,
+    edge_clusters,
     format_report,
     gold_label,
     load_events,
@@ -677,3 +679,13 @@ def test_edge_indices_are_int32():
     ):
         assert lefts.dtype == np.int32
         assert rights.dtype == np.int32
+
+
+@pytest.mark.parametrize("threshold", [0.9, 0.8, 0.6, -1.0])
+@pytest.mark.parametrize("groups", [None, ["nvd", "ghsa", "nvd"]])
+def test_edge_clusters_match_threshold_clusters(threshold, groups):
+    similarities, lefts, rights = candidate_edges(ABC, threshold, groups=groups)
+    assert np.all(similarities >= threshold)
+    assert np.all(lefts < rights)
+    expected = threshold_clusters(ABC, threshold, groups=groups)
+    assert edge_clusters(len(ABC), lefts, rights) == expected
