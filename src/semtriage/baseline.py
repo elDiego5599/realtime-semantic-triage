@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import math
+import re
 import zipfile
 from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from pydantic import ValidationError
 
 from semtriage.embed import BgeM3Embedder, Embedder, HashingEmbedder
 from semtriage.metrics import Scores, bcubed_scores, pairwise_scores
-from semtriage.models import Event
+from semtriage.models import Event, Source
 from semtriage.sanitize import sanitize
 
 DEFAULT_THRESHOLDS: tuple[float, ...] = (
@@ -32,6 +33,146 @@ DEFAULT_THRESHOLDS: tuple[float, ...] = (
 PAIR_MODES: tuple[str, ...] = ("cross-source", "all")
 
 RULES: tuple[str, ...] = ("single-link", "mutual-best")
+
+TEXT_MODES: tuple[str, ...] = ("full", "truncate", "lead")
+
+DEFAULT_MAX_CHARS = 1000
+
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_LAST_SPACE_RE = re.compile(r"\s(?!.*\s)", re.DOTALL)
+_HEADING_RE = re.compile(r"^(?:#{1,6}\s+(?P<hash>.*?)[\s#]*|\*\*(?P<bold>[^*]+)\*\*:?)$")
+_SUMMARY_HEADINGS = frozenset({"summary", "executive summary"})
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    """Return text cut to at most `max_chars` characters at a whitespace boundary.
+
+    A single word longer than the limit is cut inside the word. Trailing
+    whitespace is stripped.
+    """
+    if max_chars < 1:
+        raise ValueError(f"max_chars must be positive, got {max_chars}")
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    if not text[max_chars].isspace():
+        boundary = _LAST_SPACE_RE.search(cut)
+        if boundary is not None and boundary.start() > 0:
+            cut = cut[: boundary.start()]
+    return cut.rstrip()
+
+
+def _heading(line: str) -> str | None:
+    """Return the lowercased heading text of a heading line, else None.
+
+    Markdown `#` headings always count. A line that is only bold text counts
+    only when it names a summary, since bold sub-labels are common inside sections.
+    """
+    match = _HEADING_RE.match(line.strip())
+    if match is None:
+        return None
+    if match.group("hash") is not None:
+        return match.group("hash").strip().rstrip(":").strip().lower()
+    name = match.group("bold").strip().rstrip(":").strip().lower()
+    return name if name in _SUMMARY_HEADINGS else None
+
+
+def _without_code_blocks(lines: list[str]) -> list[str]:
+    """Drop fenced code blocks (``` or ~~~); an unclosed fence drops the rest.
+
+    A block closes on a run of the same character at least as long as the opening
+    run with nothing after it. A line whose marker repeats later on the same line
+    (inline code such as ```x```) does not open a block.
+    """
+    kept: list[str] = []
+    fence: str | None = None
+    for line in lines:
+        match = _FENCE_RE.match(line)
+        if fence is None:
+            if match is None or match.group(1) in match.group(2):
+                kept.append(line)
+            else:
+                fence = match.group(1)
+        elif match is not None and match.group(1).startswith(fence) and not match.group(2).strip():
+            fence = None
+    return kept
+
+
+def _paragraphs(lines: list[str]) -> list[str]:
+    """Group non-blank lines into paragraphs separated by blank lines."""
+    paragraphs: list[list[str]] = [[]]
+    for line in lines:
+        if line.strip():
+            paragraphs[-1].append(line)
+        elif paragraphs[-1]:
+            paragraphs.append([])
+    return ["\n".join(paragraph) for paragraph in paragraphs if paragraph]
+
+
+def lead_text(text: str) -> str:
+    """Return the title line plus the lead of a GHSA-style markdown write-up.
+
+    The first line is the title (the advisory summary) unless it is a heading.
+    Code blocks are dropped. The lead is the section under a `Summary` heading
+    when it has text, otherwise the first paragraph that is not a heading
+    (headings end paragraphs). Setext headings (underlined with `---`) are not
+    recognised and stay as text.
+    Later sections are dropped.
+    """
+    lines = _without_code_blocks(text.split("\n"))
+    title = ""
+    if lines and _heading(lines[0]) is None:
+        title = lines[0].strip()
+        lines = lines[1:]
+    lead = ""
+    for index, line in enumerate(lines):
+        if _heading(line) in _SUMMARY_HEADINGS:
+            section: list[str] = []
+            for following in lines[index + 1 :]:
+                if _heading(following) is not None:
+                    break
+                section.append(following)
+            lead = "\n\n".join(_paragraphs(section))
+            if lead:
+                break
+    if not lead:
+        body = ["" if _heading(line) is not None else line for line in lines]
+        paragraphs = _paragraphs(body)
+        lead = paragraphs[0] if paragraphs else ""
+    return "\n\n".join(part for part in (title, lead) if part)
+
+
+def _check_text_mode(text_mode: str, max_chars: int) -> None:
+    if text_mode not in TEXT_MODES:
+        raise ValueError(f"text_mode must be one of {TEXT_MODES}, got {text_mode!r}")
+    if max_chars < 1:
+        raise ValueError(f"max_chars must be positive, got {max_chars}")
+
+
+def text_mode_label(text_mode: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
+    """Return the label stored in the embedding cache, for example `lead:1000`."""
+    _check_text_mode(text_mode, max_chars)
+    return "full" if text_mode == "full" else f"{text_mode}:{max_chars}"
+
+
+def build_text(event: Event, text_mode: str, *, max_chars: int = DEFAULT_MAX_CHARS) -> str:
+    """Return the text to embed for an event.
+
+    The event text is sanitized first, exactly as in `full` mode, and only then
+    shortened: shortening only removes whole lines or a tail cut at whitespace,
+    so it cannot rebuild an identifier or URL that sanitizing removed, while
+    shortening first could cut an identifier or URL into a fragment the
+    sanitizer patterns no longer match. `truncate` caps any text at `max_chars`;
+    `lead` keeps the title and lead of GHSA write-ups (see `lead_text`) and the
+    plain description of NVD events, then caps at `max_chars`.
+    """
+    _check_text_mode(text_mode, max_chars)
+    text = sanitize(event.text)
+    if text_mode == "full":
+        return text
+    if text_mode == "lead" and event.source == Source.GHSA:
+        text = lead_text(text)
+    return truncate_text(text, max_chars)
 
 
 def gold_label(event: Event) -> str | None:
@@ -426,6 +567,8 @@ class BaselineReport:
     pairs: str | None = None
     reference: ReferenceRow | None = None
     rule: str = "single-link"
+    text_mode: str = "full"
+    max_chars: int = DEFAULT_MAX_CHARS
 
 
 def labeled_events(events: Iterable[Event]) -> tuple[list[Event], dict[str, str], int]:
@@ -458,10 +601,12 @@ def write_embeddings(
     vectors: np.ndarray,
     *,
     embedder: str,
+    text_mode: str = "full",
 ) -> None:
     """Save event ids, a hash of the embedded texts, float32 vectors and the embedder name.
 
-    `texts` are the exact (sanitized) texts that were embedded, in the order of `ids`.
+    `texts` are the exact (sanitized, possibly shortened) texts that were embedded,
+    in the order of `ids`; `text_mode` is the `text_mode_label` that built them.
     Everything goes to one .npz file at `path`.
     """
     matrix = np.asarray(vectors, dtype=np.float32)
@@ -476,6 +621,7 @@ def write_embeddings(
             vectors=matrix,
             embedder=np.asarray(embedder, dtype=str),
             text_sha256=np.asarray(texts_sha256(texts), dtype=str),
+            text_mode=np.asarray(text_mode, dtype=str),
         )
 
 
@@ -483,11 +629,16 @@ def read_embeddings(
     path: str | Path,
     ids: Sequence[str],
     texts: Sequence[str],
+    *,
+    text_mode: str | None = None,
 ) -> tuple[np.ndarray, str]:
     """Load cached vectors, refusing them unless both ids and texts match what was saved.
 
-    `ids` must equal the stored event ids in order, and `texts` (the sanitized texts
+    `ids` must equal the stored event ids in order, and `texts` (the embedded texts
     of those events) must hash to the stored digest, so stale vectors are never reused.
+    When `text_mode` is given and the file records one (files written before text
+    modes existed do not), a different label is refused with a clearer message;
+    the hash check alone already refuses texts built with another mode.
     """
     try:
         with np.load(Path(path), allow_pickle=False) as data:
@@ -508,6 +659,12 @@ def read_embeddings(
             f"{path}: event ids do not match the labeled events "
             f"({len(stored_ids)} stored, {len(ids)} expected, same order required)"
         )
+    stored_mode = str(arrays["text_mode"]) if "text_mode" in arrays else None
+    if text_mode is not None and stored_mode is not None and stored_mode != text_mode:
+        raise ValueError(
+            f"{path}: texts differ from the ones embedded (cache built with text mode "
+            f"{stored_mode}, this run uses {text_mode}); re-embed or use the same mode"
+        )
     if str(arrays["text_sha256"]) != texts_sha256(texts):
         raise ValueError(
             f"{path}: sanitized texts differ from the ones embedded "
@@ -525,11 +682,17 @@ def run_baseline(
     rule: str = "single-link",
     save_embeddings: str | Path | None = None,
     load_embeddings: str | Path | None = None,
+    text_mode: str = "full",
+    max_chars: int = DEFAULT_MAX_CHARS,
 ) -> BaselineReport:
-    """Embed (or load cached vectors for) the labeled subset of events and evaluate it."""
+    """Embed (or load cached vectors for) the labeled subset of events and evaluate it.
+
+    `text_mode` and `max_chars` choose the embedded text (see `build_text`).
+    """
     if pairs not in PAIR_MODES:
         raise ValueError(f"pairs must be one of {PAIR_MODES}, got {pairs!r}")
     _check_rule(rule)
+    mode_label = text_mode_label(text_mode, max_chars)
     if rule == "mutual-best" and pairs != "cross-source":
         raise ValueError("the mutual-best rule needs cross-source pairs")
     if (embedder is None) == (load_embeddings is None):
@@ -538,15 +701,17 @@ def run_baseline(
     if not kept:
         raise ValueError("No labeled events to evaluate")
     ids = [event.event_id for event in kept]
-    texts = [sanitize(event.text) for event in kept]
+    texts = [build_text(event, text_mode, max_chars=max_chars) for event in kept]
 
     if embedder is None:
-        vectors, embedder_name = read_embeddings(load_embeddings, ids, texts)
+        vectors, embedder_name = read_embeddings(load_embeddings, ids, texts, text_mode=mode_label)
     else:
         vectors = embedder.embed(texts)
         embedder_name = embedder.name
     if save_embeddings is not None:
-        write_embeddings(save_embeddings, ids, texts, vectors, embedder=embedder_name)
+        write_embeddings(
+            save_embeddings, ids, texts, vectors, embedder=embedder_name, text_mode=mode_label
+        )
     rows = sweep(
         ids,
         vectors,
@@ -563,6 +728,8 @@ def run_baseline(
         pairs=pairs,
         reference=singletons_reference(ids, gold),
         rule=rule,
+        text_mode=text_mode,
+        max_chars=max_chars,
     )
 
 
@@ -590,6 +757,8 @@ def format_report(report: BaselineReport) -> str:
         lines.append(f"Pairs: {report.pairs}")
     if report.rule != "single-link":
         lines.append(f"Rule: {report.rule}")
+    if report.text_mode != "full":
+        lines.append(f"Text: {report.text_mode} (max {report.max_chars} chars)")
     lines += [
         "",
         "| threshold | clusters | pairwise P | pairwise R | pairwise F1 | B3 P | B3 R | B3 F1 |",
@@ -649,6 +818,17 @@ def _parse_thresholds(value: str) -> tuple[float, ...]:
     return thresholds
 
 
+def _positive_int(value: str) -> int:
+    """Parse a positive integer command-line value."""
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the offline baseline command-line interface."""
     parser = argparse.ArgumentParser(description="Run the offline deduplication baseline")
@@ -683,6 +863,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Linking rule: mutual-best joins two events only if each is the other's "
         "most similar cross-source event (needs --pairs cross-source)",
     )
+    parser.add_argument(
+        "--text-mode",
+        choices=TEXT_MODES,
+        default="full",
+        help="Text to embed: full sanitized text (default), truncate to --max-chars, "
+        "or lead (GHSA title plus Summary section or first paragraph, no code blocks; "
+        "NVD description), capped at --max-chars",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=f"Character cap for --text-mode truncate or lead (default {DEFAULT_MAX_CHARS})",
+    )
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument(
         "--save-embeddings",
@@ -703,6 +898,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--fp16 requires --embedder bge-m3")
     if args.rule == "mutual-best" and args.pairs != "cross-source":
         parser.error("--rule mutual-best requires --pairs cross-source")
+    if args.max_chars is not None and args.text_mode == "full":
+        parser.error("--max-chars requires --text-mode truncate or lead")
+    max_chars = DEFAULT_MAX_CHARS if args.max_chars is None else args.max_chars
     if not args.events.is_file():
         parser.error(f"events file not found: {args.events}")
 
@@ -722,6 +920,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             rule=args.rule,
             save_embeddings=args.save_embeddings,
             load_embeddings=args.load_embeddings,
+            text_mode=args.text_mode,
+            max_chars=max_chars,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -730,17 +930,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "DEFAULT_MAX_CHARS",
     "DEFAULT_THRESHOLDS",
     "PAIR_MODES",
     "RULES",
+    "TEXT_MODES",
     "BaselineReport",
     "ReferenceRow",
     "SweepRow",
+    "build_text",
     "candidate_edges",
     "edge_clusters",
     "format_report",
     "gold_label",
     "labeled_events",
+    "lead_text",
     "load_events",
     "main",
     "mutual_best_clusters",
@@ -749,8 +953,10 @@ __all__ = [
     "run_baseline",
     "singletons_reference",
     "sweep",
+    "text_mode_label",
     "texts_sha256",
     "threshold_clusters",
+    "truncate_text",
     "write_embeddings",
 ]
 
