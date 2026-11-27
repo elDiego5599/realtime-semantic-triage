@@ -4,20 +4,25 @@ import numpy as np
 import pytest
 
 from semtriage.baseline import (
-    DEFAULT_MAX_CHARS,
-    TEXT_MODES,
-    build_text,
     format_report,
-    lead_text,
     main,
     read_embeddings,
+    read_text_mode,
     run_baseline,
     texts_sha256,
-    truncate_text,
 )
 from semtriage.embed import HashingEmbedder
 from semtriage.models import Event, Source
 from semtriage.sanitize import sanitize
+from semtriage.text_mode import (
+    DEFAULT_MAX_CHARS,
+    TEXT_MODES,
+    build_text,
+    lead_text,
+    parse_text_mode_label,
+    text_mode_label,
+    truncate_text,
+)
 
 WHEN = datetime(2024, 5, 1, tzinfo=UTC)
 
@@ -264,7 +269,7 @@ def test_cache_refuses_other_text_mode(tmp_path, saved, loaded):
         max_chars=saved[1],
         save_embeddings=path,
     )
-    with pytest.raises(ValueError, match="texts differ"):
+    with pytest.raises(ValueError, match="text mode differs: cache built with "):
         run_baseline(
             sample_events(),
             None,
@@ -298,7 +303,9 @@ def test_read_embeddings_names_the_stored_text_mode(tmp_path):
     events = sample_events()
     ids = [event.event_id for event in events]
     texts = [build_text(event, "full") for event in events]
-    with pytest.raises(ValueError, match="lead:1000"):
+    with pytest.raises(
+        ValueError, match="text mode differs: cache built with lead:1000, this run uses full"
+    ):
         read_embeddings(path, ids, texts, text_mode="full")
 
 
@@ -401,3 +408,49 @@ def test_old_cache_without_text_mode_key_still_loads(tmp_path):
         )
     report = run_baseline(events, None, (0.5,), text_mode="lead", load_embeddings=path)
     assert report.n_events == len(events)
+
+
+def test_lead_mode_falls_back_to_full_text_when_lead_is_empty():
+    text = "### Impact\n```\nonly code\n```"
+    event = make_event("GHSA-jjjj-kkkk-llll", text, ("CVE-2024-0010",), Source.GHSA)
+    assert lead_text(sanitize(text)) == ""
+    assert build_text(event, "lead", max_chars=10) == "### Impact"
+
+
+def test_text_mode_label_round_trip():
+    for mode, limit in (("full", DEFAULT_MAX_CHARS), ("truncate", 40), ("lead", 1000)):
+        assert parse_text_mode_label(text_mode_label(mode, limit)) == (
+            mode,
+            DEFAULT_MAX_CHARS if mode == "full" else limit,
+        )
+
+
+@pytest.mark.parametrize("label", ["", "lead", "lead:", "lead:x", "lead:0", "full:10", "short:5"])
+def test_parse_text_mode_label_rejects_bad_labels(label):
+    with pytest.raises(ValueError, match="text mode"):
+        parse_text_mode_label(label)
+
+
+def test_read_text_mode(tmp_path):
+    path = tmp_path / "vectors.npz"
+    run_baseline(
+        sample_events(),
+        HashingEmbedder(),
+        (0.5,),
+        text_mode="truncate",
+        max_chars=40,
+        save_embeddings=path,
+    )
+    assert read_text_mode(path) == "truncate:40"
+    old = tmp_path / "old.npz"
+    with old.open("wb") as target:
+        np.savez(target, event_ids=np.asarray(["a"], dtype=str))
+    assert read_text_mode(old) == "full"
+    garbage = tmp_path / "garbage.npz"
+    garbage.write_bytes(b"not a zip")
+    with pytest.raises(ValueError, match="cannot read"):
+        read_text_mode(garbage)
+
+
+def test_truncate_keeps_word_when_only_space_is_leading() -> None:
+    assert truncate_text(" abcdef", 4) == " abc"

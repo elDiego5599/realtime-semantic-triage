@@ -8,6 +8,7 @@ from semtriage.baseline import write_embeddings
 from semtriage.errors import analyze_errors, format_error_report, main
 from semtriage.models import Event, Source
 from semtriage.sanitize import sanitize
+from semtriage.text_mode import build_text
 
 WHEN = datetime(2024, 5, 1, tzinfo=UTC)
 
@@ -283,3 +284,24 @@ def test_main_rejects_stale_texts(tmp_path, capsys):
         main(["--events", str(events_path), "--embeddings", str(cache), "--threshold", "0.9"])
     assert excinfo.value.code == 2
     assert "sanitized texts" in capsys.readouterr().err
+
+
+def test_main_runs_on_lead_cache(tmp_path, capsys):
+    events_path, cache = write_inputs(tmp_path)
+    lead_texts = [build_text(event, "lead", max_chars=20) for event in EVENTS[:5]]
+    ids = [event.event_id for event in EVENTS[:5]]
+    assert lead_texts != KEPT_TEXTS
+    write_embeddings(cache, ids, lead_texts, VECTORS, embedder="synthetic", text_mode="lead:20")
+    argv = ["--events", str(events_path), "--embeddings", str(cache), "--threshold", "0.9"]
+    assert main(argv) == 0
+    assert "Direct false edges: 1" in capsys.readouterr().out
+
+
+def test_main_rejects_lead_cache_with_wrong_label(tmp_path, capsys):
+    events_path, cache = write_inputs(tmp_path)
+    lead_texts = [build_text(event, "lead", max_chars=20) for event in EVENTS[:5]]
+    ids = [event.event_id for event in EVENTS[:5]]
+    write_embeddings(cache, ids, lead_texts, VECTORS, embedder="synthetic", text_mode="lead:30")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--events", str(events_path), "--embeddings", str(cache), "--threshold", "0.9"])
+    assert excinfo.value.code == 2

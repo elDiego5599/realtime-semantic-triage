@@ -15,9 +15,11 @@ from semtriage.baseline import (
     labeled_events,
     load_events,
     read_embeddings,
+    read_text_mode,
 )
 from semtriage.models import Event
 from semtriage.sanitize import sanitize
+from semtriage.text_mode import build_text, parse_text_mode_label
 
 QUANTILES: tuple[float, ...] = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
 SHARED_FIELDS: tuple[str, ...] = ("package", "ecosystem", "cwe", "cna", "any")
@@ -396,10 +398,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         events = load_events(args.events)
         kept, _, _ = labeled_events(events)
+        label = read_text_mode(args.embeddings)
+        text_mode, max_chars = parse_text_mode_label(label)
         vectors, embedder = read_embeddings(
             args.embeddings,
             [event.event_id for event in kept],
-            [sanitize(event.text) for event in kept],
+            [build_text(event, text_mode, max_chars=max_chars) for event in kept],
+            text_mode=label,
         )
         report = analyze_errors(
             events,
